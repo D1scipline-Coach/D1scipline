@@ -699,7 +699,6 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
 
 const Chat = () => {
   const [message, setMessage] = useState("");
-  const [reply, setReply] = useState(""); 
   const [messages, setMessages] = useState<
     { role: "user" | "assistant"; content: string }[]
   >([]);
@@ -709,11 +708,15 @@ const Chat = () => {
 const handleAskCoach = async () => {
   console.log("SEND pressed. message=", message);
 
-  if (!message.trim()) return;
+  const trimmed = message.trim();
+  if (!trimmed) return;
+
+  // Optimistically show the user's message and clear the input
+  setMessages((prev) => [...prev, { role: "user", content: trimmed }]);
+  setMessage("");
 
   try {
     setLoading(true);
-    setReply("");
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15000); // 15s timeout
@@ -724,9 +727,10 @@ const handleAskCoach = async () => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        message: message.trim(),
-        name: "Nate",
-        goal: "Build discipline",
+        message: trimmed,
+        sessionId: sessionId ?? undefined,
+        name: profile?.name ?? "User",
+        goal: profile?.goal ?? "Build discipline",
       }),
       signal: controller.signal,
     });
@@ -751,11 +755,20 @@ const handleAskCoach = async () => {
 
     console.log("Parsed reply:", data?.reply);
 
-    setReply(data?.reply ?? "No reply field returned.");
+    // Persist session so subsequent messages continue the same conversation
+    if (data.sessionId) setSessionId(data.sessionId);
+
+    setMessages((prev) => [
+      ...prev,
+      { role: "assistant", content: data?.reply ?? "No reply field returned." },
+    ]);
   } catch (err: any) {
     console.error("handleAskCoach ERROR:", err);
     Alert.alert("Error", err?.message ? String(err.message) : String(err));
-    setReply("❌ Error: " + (err?.message ? String(err.message) : String(err)));
+    setMessages((prev) => [
+      ...prev,
+      { role: "assistant", content: "❌ Error: " + (err?.message ? String(err.message) : String(err)) },
+    ]);
   } finally {
     setLoading(false);
   }
@@ -823,4 +836,26 @@ const handleAskCoach = async () => {
   );
 };
 
+  // ---------- Authenticated shell ----------
+  return (
+    <SafeAreaView style={styles.screen}>
+      <StatusBar barStyle="light-content" />
+      <View style={{ flex: 1 }}>
+        {tab === "Today" && <Today />}
+        {tab === "Schedule" && <Schedule />}
+        {tab === "Chat" && <Chat />}
+      </View>
+      <View style={styles.tabBar}>
+        {(["Today", "Schedule", "Chat"] as TabKey[]).map((t) => (
+          <Pressable
+            key={t}
+            onPress={() => setTab(t)}
+            style={[styles.tabBtn, tab === t && styles.tabBtnActive]}
+          >
+            <Text style={[styles.tabText, tab === t && styles.tabTextActive]}>{t}</Text>
+          </Pressable>
+        ))}
+      </View>
+    </SafeAreaView>
+  );
 }
