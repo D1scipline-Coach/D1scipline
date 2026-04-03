@@ -1,8 +1,10 @@
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Notifications from "expo-notifications";
 import React, { useEffect, useMemo, useState } from "react";
 import {
   Alert,
   FlatList,
+  KeyboardAvoidingView,
   Platform,
   Pressable,
   SafeAreaView,
@@ -15,6 +17,14 @@ import {
   View,
 } from "react-native";
 import { API_BASE_URL } from "../constants/api";
+
+// ---------- Storage keys ----------
+const STORE = {
+  profile: "dc:profile",
+  blocks:  "dc:blocks",
+  tasks:   "dc:tasks",
+  chat:    "dc:chat",
+} as const;
 
 
 /**
@@ -331,6 +341,9 @@ async function ensureNotificationPermissions(): Promise<boolean> {
 
 // ---------- App ----------
 export default function Index() {
+  // persistence — false until the initial AsyncStorage load completes
+  const [loaded, setLoaded] = useState(false);
+
   // profile/auth
   const [authed, setAuthed] = useState(false);
   const [tab, setTab] = useState<TabKey>("Today");
@@ -339,6 +352,10 @@ export default function Index() {
   // routine
   const [blocks, setBlocks] = useState<ScheduleBlock[]>([]);
   const [tasks, setTasks] = useState<TimedTask[]>([]);
+
+  // chat — lifted here so they survive tab switches and can be persisted
+  const [messages, setMessages] = useState<{ role: "user" | "assistant"; content: string }[]>([]);
+  const [sessionId, setSessionId] = useState<string | null>(null);
 
   // notifications
   const [notifReady, setNotifReady] = useState(false);
@@ -352,11 +369,58 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
   const [wake, setWake] = useState("7:00 AM");
   const [sleep, setSleep] = useState("11:00 PM");
 
-  // Schedule form fields
-  const [blockTitle, setBlockTitle] = useState("");
-  const [blockType, setBlockType] = useState<BlockType>("Work");
-  const [blockStart, setBlockStart] = useState("9:00 AM");
-  const [blockEnd, setBlockEnd] = useState("5:00 PM");
+  // Load persisted data once on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        const [profileRaw, blocksRaw, tasksRaw, chatRaw] = await Promise.all([
+          AsyncStorage.getItem(STORE.profile),
+          AsyncStorage.getItem(STORE.blocks),
+          AsyncStorage.getItem(STORE.tasks),
+          AsyncStorage.getItem(STORE.chat),
+        ]);
+        if (profileRaw) {
+          setProfile(JSON.parse(profileRaw) as Profile);
+          setAuthed(true);
+        }
+        if (blocksRaw) setBlocks(JSON.parse(blocksRaw) as ScheduleBlock[]);
+        if (tasksRaw)  setTasks(JSON.parse(tasksRaw) as TimedTask[]);
+        if (chatRaw) {
+          const { messages: msgs, sessionId: sid } = JSON.parse(chatRaw);
+          if (msgs)  setMessages(msgs);
+          if (sid)   setSessionId(sid);
+        }
+      } catch (e) {
+        console.warn("[storage] Load failed:", e);
+      } finally {
+        setLoaded(true);
+      }
+    })();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Save profile whenever it changes (after initial load)
+  useEffect(() => {
+    if (!loaded || !profile) return;
+    AsyncStorage.setItem(STORE.profile, JSON.stringify(profile)).catch(console.warn);
+  }, [profile, loaded]);
+
+  // Save blocks whenever they change (after initial load)
+  useEffect(() => {
+    if (!loaded) return;
+    AsyncStorage.setItem(STORE.blocks, JSON.stringify(blocks)).catch(console.warn);
+  }, [blocks, loaded]);
+
+  // Save tasks whenever they change (after initial load)
+  useEffect(() => {
+    if (!loaded) return;
+    AsyncStorage.setItem(STORE.tasks, JSON.stringify(tasks)).catch(console.warn);
+  }, [tasks, loaded]);
+
+  // Save chat messages and sessionId whenever either changes (after initial load)
+  useEffect(() => {
+    if (!loaded) return;
+    AsyncStorage.setItem(STORE.chat, JSON.stringify({ messages, sessionId })).catch(console.warn);
+  }, [messages, sessionId, loaded]);
 
   useEffect(() => {
     (async () => {
@@ -450,6 +514,10 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
     });
     Alert.alert("Test scheduled", "You should get a notification in ~30 seconds.");
   }
+
+  // Block render until the initial storage load is done.
+  // Prevents a flash of the onboarding screen for returning users.
+  if (!loaded) return null;
 
   // ---------- Onboarding ----------
   if (!authed) {
@@ -579,6 +647,12 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
   };
 
   const Schedule = () => {
+    // Kept local so typing doesn't re-render Index and dismiss the keyboard
+    const [blockTitle, setBlockTitle] = useState("");
+    const [blockType, setBlockType] = useState<BlockType>("Work");
+    const [blockStart, setBlockStart] = useState("9:00 AM");
+    const [blockEnd, setBlockEnd] = useState("5:00 PM");
+
     const typeButtons: BlockType[] = ["Work", "School", "Kids", "Commute", "Other"];
 
     const addBlock = () => {
@@ -699,11 +773,8 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
 
 const Chat = () => {
   const [message, setMessage] = useState("");
-  const [messages, setMessages] = useState<
-    { role: "user" | "assistant"; content: string }[]
-  >([]);
   const [loading, setLoading] = useState(false);
-  const [sessionId, setSessionId] = useState<string | null>(null);
+  // messages and sessionId are lifted to Index state for persistence and tab-switch survival
 
 const handleAskCoach = async () => {
   console.log("SEND pressed. message=", message);
@@ -775,7 +846,11 @@ const handleAskCoach = async () => {
 };
 
   return (
-    <View style={{ flex: 1, padding: 20 }}>
+    <KeyboardAvoidingView
+      style={{ flex: 1, padding: 20 }}
+      behavior={Platform.OS === "ios" ? "padding" : undefined}
+      keyboardVerticalOffset={80}
+    >
       <ScrollView style={{ flex: 1 }}>
         {messages.map((msg, index) => (
           <View
@@ -832,7 +907,7 @@ const handleAskCoach = async () => {
           <Text style={{ color: "white" }}>Send</Text>
         </TouchableOpacity>
       </View>
-    </View>
+    </KeyboardAvoidingView>
   );
 };
 
