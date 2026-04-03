@@ -911,6 +911,189 @@ const handleAskCoach = async () => {
   );
 };
 
+  // ---------- Progress ----------
+  const Progress = () => {
+    const done = tasks.filter((t) => t.done).length;
+    const total = tasks.length;
+
+    const kinds: TaskKind[] = ["Walk", "Meal", "Hydration", "Mobility", "Sleep"];
+    const breakdown = kinds
+      .map((k) => ({
+        kind: k,
+        done: tasks.filter((t) => t.kind === k && t.done).length,
+        total: tasks.filter((t) => t.kind === k).length,
+      }))
+      .filter((b) => b.total > 0);
+
+    return (
+      <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 20 }}>
+        <View style={{ gap: 12 }}>
+          <Text style={styles.h2}>Progress</Text>
+          <Text style={styles.sub2}>{profile?.goal ?? "Your goal"}</Text>
+
+          <Card>
+            <View style={styles.rowBetween}>
+              <Text style={styles.label}>Today's score</Text>
+              <Chip label={`${score}/100`} />
+            </View>
+            <Text style={styles.bodyMuted}>
+              {total === 0
+                ? "No plan yet — go to Today and generate one."
+                : `${done} of ${total} tasks completed`}
+            </Text>
+          </Card>
+
+          {breakdown.length > 0 && (
+            <Card>
+              <Text style={styles.label}>By category</Text>
+              <View style={{ gap: 8, marginTop: 4 }}>
+                {breakdown.map((b) => (
+                  <View key={b.kind} style={styles.rowBetween}>
+                    <Text style={styles.bodyMuted}>{b.kind}</Text>
+                    <Text style={styles.bodyMuted}>
+                      {b.done}/{b.total} {b.done === b.total ? "✓" : ""}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            </Card>
+          )}
+
+          {tasks.length > 0 && (
+            <Card>
+              <Text style={styles.label}>Task list</Text>
+              <View style={{ gap: 8, marginTop: 4 }}>
+                {tasks.map((t) => (
+                  <View key={t.id} style={styles.rowBetween}>
+                    <Text
+                      style={[
+                        styles.bodyMuted,
+                        t.done && { textDecorationLine: "line-through", color: "#555" },
+                      ]}
+                    >
+                      {t.timeText}{"  "}{t.title}
+                    </Text>
+                    <Text style={styles.miniNote}>{t.done ? "✓" : "·"}</Text>
+                  </View>
+                ))}
+              </View>
+            </Card>
+          )}
+        </View>
+      </ScrollView>
+    );
+  };
+
+  // ---------- Settings ----------
+  const Settings = () => {
+    const [editName, setEditName] = useState(profile?.name ?? "");
+    const [editGoal, setEditGoal] = useState(profile?.goal ?? "");
+    const [editWake, setEditWake] = useState(profile?.wake ?? "7:00 AM");
+    const [editSleep, setEditSleep] = useState(profile?.sleep ?? "11:00 PM");
+
+    const saveProfile = () => {
+      const updated = {
+        name: editName.trim(),
+        goal: editGoal.trim(),
+        wake: editWake.trim(),
+        sleep: editSleep.trim(),
+      };
+      if (!updated.name) {
+        Alert.alert("Name required", "Please enter your name.");
+        return;
+      }
+      setProfile(updated);
+      Alert.alert("Saved", "Your profile has been updated.");
+    };
+
+    const resetApp = () => {
+      Alert.alert(
+        "Reset app",
+        "This will delete your profile, schedule, tasks, and chat history. This cannot be undone.",
+        [
+          { text: "Cancel", style: "cancel" },
+          {
+            text: "Reset",
+            style: "destructive",
+            onPress: async () => {
+              await AsyncStorage.multiRemove(Object.values(STORE));
+              setProfile(null);
+              setBlocks([]);
+              setTasks([]);
+              setMessages([]);
+              setSessionId(null);
+              setAuthed(false);
+            },
+          },
+        ]
+      );
+    };
+
+    return (
+      <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 20 }}>
+        <View style={{ gap: 12 }}>
+          <Text style={styles.h2}>Settings</Text>
+          <Text style={styles.sub2}>Adjust your profile and preferences.</Text>
+
+          <Card>
+            <Text style={styles.label}>Profile</Text>
+            <Text style={styles.smallLabel}>Name</Text>
+            <TextInput
+              value={editName}
+              onChangeText={setEditName}
+              placeholderTextColor="#777"
+              style={styles.input}
+            />
+            <Text style={styles.smallLabel}>Goal</Text>
+            <TextInput
+              value={editGoal}
+              onChangeText={setEditGoal}
+              placeholderTextColor="#777"
+              style={styles.input}
+            />
+            <Text style={styles.smallLabel}>Wake time</Text>
+            <TextInput
+              value={editWake}
+              onChangeText={setEditWake}
+              placeholderTextColor="#777"
+              style={styles.input}
+            />
+            <Text style={styles.smallLabel}>Sleep time</Text>
+            <TextInput
+              value={editSleep}
+              onChangeText={setEditSleep}
+              placeholderTextColor="#777"
+              style={styles.input}
+            />
+            <View style={{ height: 10 }} />
+            <PrimaryButton title="Save profile" onPress={saveProfile} />
+          </Card>
+
+          <Card>
+            <Text style={styles.label}>Notifications</Text>
+            <Text style={styles.bodyMuted}>
+              Status: {notifReady ? "Enabled" : "Disabled"}
+            </Text>
+            {!notifReady && (
+              <Text style={styles.miniNote}>
+                To enable, open your phone's Settings → Notifications → Expo Go and turn them on.
+              </Text>
+            )}
+          </Card>
+
+          <Card>
+            <Text style={styles.label}>Data</Text>
+            <Text style={styles.bodyMuted}>
+              Erase everything and return to onboarding.
+            </Text>
+            <View style={{ height: 8 }} />
+            <SmallButton title="Reset app" onPress={resetApp} />
+          </Card>
+        </View>
+      </ScrollView>
+    );
+  };
+
   // ---------- Authenticated shell ----------
   return (
     <SafeAreaView style={styles.screen}>
@@ -919,9 +1102,11 @@ const handleAskCoach = async () => {
         {tab === "Today" && <Today />}
         {tab === "Schedule" && <Schedule />}
         {tab === "Chat" && <Chat />}
+        {tab === "Progress" && <Progress />}
+        {tab === "Settings" && <Settings />}
       </View>
       <View style={styles.tabBar}>
-        {(["Today", "Schedule", "Chat"] as TabKey[]).map((t) => (
+        {(["Today", "Schedule", "Chat", "Progress", "Settings"] as TabKey[]).map((t) => (
           <Pressable
             key={t}
             onPress={() => setTab(t)}
