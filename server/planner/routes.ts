@@ -65,7 +65,7 @@ function apiError(res: Response, status: number, code: ErrorCode, message: strin
 }
 
 function formatZodError(err: ZodError): string {
-  return err.errors.map((e) => `${e.path.join(".")}: ${e.message}`).join("; ");
+  return err.issues.map((e) => `${e.path.join(".")}: ${e.message}`).join("; ");
 }
 
 /**

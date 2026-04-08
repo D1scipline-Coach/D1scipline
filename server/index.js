@@ -358,7 +358,7 @@ app.post("/api/planner/generate", async (req, res) => {
     // Validate AI output before touching storage — raw AI text never enters the store
     const parsed = AIPlannerOutputSchema.safeParse(raw);
     if (!parsed.success) {
-      const detail = parsed.error.errors.map((e) => `${e.path.join(".")}: ${e.message}`).join("; ");
+      const detail = parsed.error.issues.map((e) => `${e.path.join(".")}: ${e.message}`).join("; ");
       console.error("[planner/generate] schema validation failed:", detail);
       return res.status(502).json({ error: "AI output failed validation", details: detail });
     }
