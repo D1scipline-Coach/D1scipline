@@ -188,7 +188,7 @@ Schema (all fields required):
       "id":        "task_1",
       "timeText":  "7:00 AM",
       "title":     "specific task name — a real action, not a category",
-      "kind":      "Workout|Nutrition|Hydration|Mobility|Recovery|Habit|Sleep",
+      "kind":      "Workout | Nutrition | Hydration | Mobility | Recovery | Habit | Sleep — use EXACTLY one of these values, case-sensitive, no synonyms or variants allowed",
       "priority":  "high|medium|low",
       "rationale": "why this task at this time — one sentence"
     }

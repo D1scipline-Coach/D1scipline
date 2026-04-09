@@ -51,6 +51,27 @@ import { replacePlan, getPlan, getPlanIdForUserDate, getTasksByPlan, getTask, up
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Normalize AI-returned task kind to the exact enum value.
+ * The AI occasionally returns case variants or synonyms (e.g. "meal", "workout", "stretch").
+ * This mapping converts near-matches before Zod validation so valid plans aren't rejected.
+ */
+function normalizeTaskKind(raw: unknown): unknown {
+  if (typeof raw !== "string") return raw;
+  const s = raw.trim();
+  const lower = s.toLowerCase();
+  const exact = ["Workout","Nutrition","Hydration","Mobility","Recovery","Habit","Sleep"];
+  if (exact.includes(s)) return s;
+  if (lower === "workout" || lower === "exercise" || lower === "training" || lower === "gym" || lower === "weightlifting" || lower === "lifting") return "Workout";
+  if (lower === "nutrition" || lower === "meal" || lower === "meals" || lower === "eating" || lower === "food" || lower === "diet" || lower === "breakfast" || lower === "lunch" || lower === "dinner") return "Nutrition";
+  if (lower === "hydration" || lower === "water" || lower === "drinking" || lower === "fluids" || lower === "drink") return "Hydration";
+  if (lower === "mobility" || lower === "stretching" || lower === "stretch" || lower === "flexibility" || lower === "yoga" || lower === "foam rolling") return "Mobility";
+  if (lower === "recovery" || lower === "rest" || lower === "foam roll" || lower === "breathwork" || lower === "walk" || lower === "walking" || lower === "active recovery") return "Recovery";
+  if (lower === "habit" || lower === "routine" || lower === "daily habit" || lower === "mindset" || lower === "journaling" || lower === "meditation") return "Habit";
+  if (lower === "sleep" || lower === "bedtime" || lower === "wind-down" || lower === "wind down" || lower === "sleep prep" || lower === "night routine") return "Sleep";
+  return s; // let Zod catch truly unknown values
+}
+
 /** Strip HTML and enforce max length. Applies to all AI-sourced strings. */
 function sanitize(value: unknown, maxLen = 500): string {
   return String(value ?? "")
@@ -109,6 +130,17 @@ async function callAIPlanner(
     rawJson = JSON.parse(rawText);
   } catch {
     throw new Error("__BAD_JSON__");
+  }
+
+  // Normalize task kinds before validation — AI occasionally returns variants (e.g. "meal", "stretch")
+  if (rawJson && typeof rawJson === "object" && Array.isArray((rawJson as Record<string, unknown>).tasks)) {
+    (rawJson as Record<string, unknown>).tasks = (
+      (rawJson as Record<string, unknown>).tasks as unknown[]
+    ).map((t) =>
+      t && typeof t === "object"
+        ? { ...(t as object), kind: normalizeTaskKind((t as Record<string, unknown>).kind) }
+        : t
+    );
   }
 
   return AIPlannerOutputSchema.parse(rawJson); // throws ZodError on schema violation

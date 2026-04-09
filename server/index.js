@@ -53,6 +53,27 @@ function sanitize(str, maxLen = 500) {
 }
 
 /**
+ * Normalize AI-returned task kind to the exact enum value.
+ * The AI occasionally returns case variants or synonyms (e.g. "meal", "workout", "stretch").
+ * This mapping converts near-matches before Zod validation so valid plans aren't rejected.
+ */
+function normalizeTaskKind(raw) {
+  if (typeof raw !== "string") return raw;
+  const s = raw.trim();
+  const lower = s.toLowerCase();
+  const exact = ["Workout","Nutrition","Hydration","Mobility","Recovery","Habit","Sleep"];
+  if (exact.includes(s)) return s;
+  if (lower === "workout" || lower === "exercise" || lower === "training" || lower === "gym" || lower === "weightlifting" || lower === "lifting") return "Workout";
+  if (lower === "nutrition" || lower === "meal" || lower === "meals" || lower === "eating" || lower === "food" || lower === "diet" || lower === "breakfast" || lower === "lunch" || lower === "dinner") return "Nutrition";
+  if (lower === "hydration" || lower === "water" || lower === "drinking" || lower === "fluids" || lower === "drink") return "Hydration";
+  if (lower === "mobility" || lower === "stretching" || lower === "stretch" || lower === "flexibility" || lower === "yoga" || lower === "foam rolling") return "Mobility";
+  if (lower === "recovery" || lower === "rest" || lower === "foam roll" || lower === "breathwork" || lower === "walk" || lower === "walking" || lower === "active recovery") return "Recovery";
+  if (lower === "habit" || lower === "routine" || lower === "daily habit" || lower === "mindset" || lower === "journaling" || lower === "meditation") return "Habit";
+  if (lower === "sleep" || lower === "bedtime" || lower === "wind-down" || lower === "wind down" || lower === "sleep prep" || lower === "night routine") return "Sleep";
+  return s; // let Zod catch truly unknown values
+}
+
+/**
  * Build the planner system prompt from structured input.
  * This is the single place to evolve planner intelligence.
  */
@@ -124,7 +145,7 @@ Schema:
       "id": "task_1",
       "timeText": "7:00 AM",
       "title": "specific task name — not a category, a real action",
-      "kind": "Workout|Nutrition|Hydration|Mobility|Recovery|Habit|Sleep",
+      "kind": "Workout | Nutrition | Hydration | Mobility | Recovery | Habit | Sleep — use EXACTLY one of these values, case-sensitive, no synonyms or variants allowed",
       "priority": "high|medium|low",
       "rationale": "why this task at this time — one sentence"
     }
@@ -353,6 +374,11 @@ app.post("/api/planner/generate", async (req, res) => {
     } catch {
       console.error("[planner/generate] AI returned malformed JSON. Raw length:", rawText.length);
       return res.status(502).json({ error: "AI returned malformed JSON — please try again." });
+    }
+
+    // Normalize task kinds before validation — AI occasionally returns variants (e.g. "meal", "stretch")
+    if (raw && Array.isArray(raw.tasks)) {
+      raw.tasks = raw.tasks.map((t) => ({ ...t, kind: normalizeTaskKind(t.kind) }));
     }
 
     // Validate AI output before touching storage — raw AI text never enters the store
