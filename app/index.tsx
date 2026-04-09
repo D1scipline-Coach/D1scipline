@@ -161,6 +161,25 @@ type WorkoutSession = {
   exercises:        WorkoutExercise[];
 };
 
+// Replace getNutritionForTask() to connect to real data without touching this schema.
+type MealEntry = {
+  id:      string;
+  label:   string;   // "Breakfast", "Lunch", "Dinner", "Snack"
+  time:    string;   // "7:30 AM"
+  focus:   string;   // one-line description of this meal's job
+  example: string;   // suggested foods — short, scannable
+};
+
+type NutritionPlan = {
+  plan_id:     string;
+  title:       string;
+  focus:       string;    // day-level objective
+  calories:    number | null;
+  protein_g:   number | null;
+  meals:       MealEntry[];
+  groceryList: string[];
+};
+
 type TabKey = "Today" | "Schedule" | "Chat" | "Progress" | "Settings";
 
 // ---------- Helpers ----------
@@ -494,6 +513,68 @@ const DEV_MOCK_WORKOUT: WorkoutSession = {
  */
 function getWorkoutForTask(_task: TimedTask): WorkoutSession {
   return DEV_MOCK_WORKOUT;
+}
+
+// ─── Dev Mock Nutrition Data ─────────────────────────────────────────────────
+// Full nutrition day used when no planner-linked nutrition plan exists.
+// Replace getNutritionForTask() below to swap in real data — no other changes needed.
+const DEV_MOCK_NUTRITION: NutritionPlan = {
+  plan_id:   "mock-nutrition-day",
+  title:     "Nutrition Day",
+  focus:     "High protein, moderate carbs. Build the plate around the protein source every meal.",
+  calories:  2200,
+  protein_g: 175,
+  meals: [
+    {
+      id:      "meal_1",
+      label:   "Breakfast",
+      time:    "7:30 AM",
+      focus:   "Anchor the day with protein — prevents cravings later",
+      example: "3 eggs + 150g Greek yogurt + oats + berries",
+    },
+    {
+      id:      "meal_2",
+      label:   "Lunch",
+      time:    "12:30 PM",
+      focus:   "Lean protein + complex carbs to fuel the afternoon",
+      example: "200g chicken breast + rice + greens + olive oil",
+    },
+    {
+      id:      "meal_3",
+      label:   "Dinner",
+      time:    "7:00 PM",
+      focus:   "Protein-forward, lighter on carbs for the evening",
+      example: "Salmon fillet + sweet potato + steamed broccoli",
+    },
+    {
+      id:      "meal_4",
+      label:   "Snack",
+      time:    "4:00 PM",
+      focus:   "Bridge the gap — protein over sugar",
+      example: "Cottage cheese + handful of almonds, or protein shake",
+    },
+  ],
+  groceryList: [
+    "Chicken breast (500g)",
+    "Salmon fillet (200g)",
+    "Eggs (6-pack)",
+    "Greek yogurt (500g tub)",
+    "Oats",
+    "Sweet potatoes",
+    "Brown rice or quinoa",
+    "Broccoli / mixed greens",
+    "Almonds or mixed nuts",
+    "Olive oil",
+  ],
+};
+
+/**
+ * Resolve a TimedTask to a NutritionPlan.
+ * V1: always returns the mock plan. When the backend supplies planner-linked
+ * nutrition data, fetch/look up by task.id or task.planId here.
+ */
+function getNutritionForTask(_task: TimedTask): NutritionPlan {
+  return DEV_MOCK_NUTRITION;
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1588,6 +1669,380 @@ const TASK_CONTENT: Partial<Record<TaskKind, TaskDetailContent>> = {
   },
 };
 
+// ---------- Nutrition Detail Modal ----------
+function NutritionDetailModal({
+  task,
+  taskDone,
+  visible,
+  onClose,
+  onCompleteTask,
+}: {
+  task:           TimedTask | null;
+  taskDone:       boolean;
+  visible:        boolean;
+  onClose:        () => void;
+  onCompleteTask: (id: string) => void;
+}) {
+  const [checkedMeals, setCheckedMeals] = React.useState<Set<string>>(new Set());
+
+  const plan        = task ? getNutritionForTask(task) : null;
+  const totalMeals  = plan?.meals.length ?? 0;
+  const doneCount   = checkedMeals.size;
+  const allDone     = totalMeals > 0 && doneCount === totalMeals;
+  const progressPct = totalMeals > 0 ? Math.round((doneCount / totalMeals) * 100) : 0;
+
+  // Reset or pre-fill on open
+  React.useEffect(() => {
+    if (!visible || !plan) return;
+    if (taskDone) {
+      setCheckedMeals(new Set(plan.meals.map((m) => m.id)));
+    } else {
+      setCheckedMeals(new Set());
+    }
+  }, [visible]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Auto-complete task when all meals are checked
+  React.useEffect(() => {
+    if (allDone && !taskDone && task) {
+      onCompleteTask(task.id);
+    }
+  }, [allDone]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  if (!task || !plan) return null;
+
+  const GREEN = "#66bb6a";
+  const NUTRITION_COLOR = KIND_COLORS.Nutrition?.color ?? "#66bb6a";
+  const NUTRITION_BG    = KIND_COLORS.Nutrition?.backgroundColor ?? "#0a1f0b";
+
+  const toggleMeal = (id: string) => {
+    setCheckedMeals((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  return (
+    <Modal
+      visible={visible}
+      animationType="slide"
+      onRequestClose={onClose}
+    >
+      <SafeAreaView style={{ flex: 1, backgroundColor: "#06060c" }}>
+        <StatusBar barStyle="light-content" />
+
+        {/* ── Top bar ────────────────────────────────────────────────────────── */}
+        <View style={{
+          flexDirection: "row",
+          alignItems: "center",
+          paddingHorizontal: 20,
+          paddingTop: 10,
+          paddingBottom: 14,
+        }}>
+          <Pressable
+            onPress={onClose}
+            hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+            style={{
+              width: 36,
+              height: 36,
+              borderRadius: 18,
+              backgroundColor: "#0e0e18",
+              borderWidth: 1,
+              borderColor: "#1e1e2e",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            <Text style={{ color: "#5a5a7a", fontSize: 14, fontWeight: "700", lineHeight: 16 }}>✕</Text>
+          </Pressable>
+
+          <View style={{ flex: 1 }} />
+
+          {/* Meals progress pill */}
+          <View style={{
+            backgroundColor: doneCount > 0 ? NUTRITION_COLOR + "18" : "#0e0e18",
+            borderWidth: 1,
+            borderColor: doneCount > 0 ? NUTRITION_COLOR + "40" : "#1e1e2e",
+            borderRadius: 10,
+            paddingHorizontal: 12,
+            paddingVertical: 6,
+          }}>
+            <Text style={{
+              color: doneCount > 0 ? NUTRITION_COLOR : "#3a3a5a",
+              fontSize: 12,
+              fontWeight: "800",
+              letterSpacing: 0.3,
+            }}>
+              {doneCount}/{totalMeals} meals
+            </Text>
+          </View>
+        </View>
+
+        <ScrollView
+          showsVerticalScrollIndicator={false}
+          contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 56 }}
+        >
+
+          {/* ── Identity ──────────────────────────────────────────────────────── */}
+          <View style={{ marginBottom: 26 }}>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 14 }}>
+              <View style={{ backgroundColor: NUTRITION_BG, borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3 }}>
+                <Text style={{ color: NUTRITION_COLOR, fontSize: 10, fontWeight: "800", letterSpacing: 0.8 }}>NUTRITION</Text>
+              </View>
+              <Text style={{ color: "#2e2e48", fontSize: 11, fontWeight: "600" }}>{task.timeText}</Text>
+            </View>
+
+            <Text style={{
+              color: "#eeeef5",
+              fontSize: 24,
+              fontWeight: "900",
+              letterSpacing: -0.6,
+              lineHeight: 30,
+              marginBottom: 6,
+            }}>
+              {task.title}
+            </Text>
+            <Text style={{ color: "#4a4a7a", fontSize: 13, fontWeight: "500", lineHeight: 20 }}>
+              {plan.focus}
+            </Text>
+          </View>
+
+          {/* ── Goals row ─────────────────────────────────────────────────────── */}
+          {(plan.calories != null || plan.protein_g != null) && (
+            <View style={{
+              flexDirection: "row",
+              gap: 10,
+              marginBottom: 28,
+            }}>
+              {plan.calories != null && (
+                <View style={{
+                  flex: 1,
+                  backgroundColor: "#0a0a14",
+                  borderWidth: 1,
+                  borderColor: "#1a1a2a",
+                  borderRadius: 14,
+                  padding: 14,
+                  alignItems: "center",
+                  gap: 4,
+                }}>
+                  <Text style={{ color: "#eeeef5", fontSize: 26, fontWeight: "900", letterSpacing: -1 }}>
+                    {plan.calories.toLocaleString()}
+                  </Text>
+                  <Text style={{ color: "#40405a", fontSize: 10, fontWeight: "800", letterSpacing: 1 }}>
+                    CALORIES
+                  </Text>
+                </View>
+              )}
+              {plan.protein_g != null && (
+                <View style={{
+                  flex: 1,
+                  backgroundColor: "#0a0a14",
+                  borderWidth: 1,
+                  borderColor: "#1a1a2a",
+                  borderRadius: 14,
+                  padding: 14,
+                  alignItems: "center",
+                  gap: 4,
+                }}>
+                  <Text style={{ color: NUTRITION_COLOR, fontSize: 26, fontWeight: "900", letterSpacing: -1 }}>
+                    {plan.protein_g}g
+                  </Text>
+                  <Text style={{ color: "#40405a", fontSize: 10, fontWeight: "800", letterSpacing: 1 }}>
+                    PROTEIN
+                  </Text>
+                </View>
+              )}
+            </View>
+          )}
+
+          {/* ── Progress bar ──────────────────────────────────────────────────── */}
+          <View style={{ marginBottom: 28 }}>
+            <View style={{ height: 3, backgroundColor: "#111120", borderRadius: 2, overflow: "hidden", marginBottom: 8 }}>
+              <View style={{
+                height: 3,
+                width: `${progressPct}%` as any,
+                backgroundColor: allDone ? GREEN : NUTRITION_COLOR,
+                borderRadius: 2,
+              }} />
+            </View>
+            <Text style={{ color: "#3a3a5a", fontSize: 11, fontWeight: "600" }}>
+              {allDone
+                ? "All meals complete"
+                : doneCount > 0
+                  ? `${doneCount} of ${totalMeals} meals done`
+                  : `${totalMeals} meals today`}
+            </Text>
+          </View>
+
+          {/* ── Meal cards ────────────────────────────────────────────────────── */}
+          <Text style={{ color: "#40405a", fontSize: 10, fontWeight: "800", letterSpacing: 1, marginBottom: 12 }}>
+            MEAL PLAN
+          </Text>
+          <View style={{ gap: 8, marginBottom: 32 }}>
+            {plan.meals.map((meal) => {
+              const done = checkedMeals.has(meal.id);
+              return (
+                <Pressable
+                  key={meal.id}
+                  onPress={() => toggleMeal(meal.id)}
+                  style={{
+                    backgroundColor: done ? "#080808" : "#0c0c18",
+                    borderWidth: 1,
+                    borderColor: done ? "#111118" : "#1c1c2c",
+                    borderRadius: 14,
+                    flexDirection: "row",
+                    alignItems: "flex-start",
+                    padding: 16,
+                    gap: 14,
+                  }}
+                >
+                  {/* Checkbox */}
+                  <View style={{
+                    width: 22,
+                    height: 22,
+                    borderRadius: 6,
+                    borderWidth: 1.5,
+                    borderColor: done ? GREEN : "#2e2e42",
+                    backgroundColor: done ? GREEN + "14" : "transparent",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    marginTop: 1,
+                    flexShrink: 0,
+                  }}>
+                    {done && (
+                      <Text style={{ color: GREEN, fontSize: 11, fontWeight: "900", lineHeight: 14 }}>✓</Text>
+                    )}
+                  </View>
+
+                  {/* Meal info */}
+                  <View style={{ flex: 1, gap: 4 }}>
+                    {/* Label + time */}
+                    <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+                      <Text style={{
+                        color: done ? "#404040" : "#d0d0dc",
+                        fontSize: 14,
+                        fontWeight: "700",
+                        textDecorationLine: done ? "line-through" : "none",
+                      }}>
+                        {meal.label}
+                      </Text>
+                      <Text style={{ color: done ? "#2a2a2a" : "#404058", fontSize: 11, fontWeight: "600" }}>
+                        {meal.time}
+                      </Text>
+                    </View>
+
+                    {/* Focus line */}
+                    <Text style={{
+                      color: done ? "#303030" : "#5858a0",
+                      fontSize: 12,
+                      fontWeight: "500",
+                      lineHeight: 17,
+                    }}>
+                      {meal.focus}
+                    </Text>
+
+                    {/* Example */}
+                    <Text style={{
+                      color: done ? "#282828" : "#505065",
+                      fontSize: 12,
+                      lineHeight: 17,
+                      fontStyle: "italic",
+                      marginTop: 2,
+                    }}>
+                      {meal.example}
+                    </Text>
+                  </View>
+                </Pressable>
+              );
+            })}
+          </View>
+
+          {/* ── Grocery list ──────────────────────────────────────────────────── */}
+          {plan.groceryList.length > 0 && (
+            <View style={{ marginBottom: 32 }}>
+              <Text style={{ color: "#40405a", fontSize: 10, fontWeight: "800", letterSpacing: 1, marginBottom: 12 }}>
+                GROCERY LIST
+              </Text>
+              <View style={{
+                backgroundColor: "#08080f",
+                borderWidth: 1,
+                borderColor: "#141420",
+                borderRadius: 14,
+                padding: 16,
+                gap: 10,
+              }}>
+                {plan.groceryList.map((item, i) => (
+                  <View key={i} style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+                    <View style={{
+                      width: 5,
+                      height: 5,
+                      borderRadius: 3,
+                      backgroundColor: NUTRITION_COLOR + "60",
+                      flexShrink: 0,
+                    }} />
+                    <Text style={{ color: "#6868a0", fontSize: 13, fontWeight: "500", flex: 1 }}>
+                      {item}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            </View>
+          )}
+
+          {/* ── All done summary ──────────────────────────────────────────────── */}
+          {allDone && (
+            <View style={{
+              backgroundColor: GREEN + "0a",
+              borderWidth: 1,
+              borderColor: GREEN + "25",
+              borderRadius: 14,
+              padding: 16,
+              alignItems: "center",
+              marginBottom: 20,
+              gap: 4,
+            }}>
+              <Text style={{ color: GREEN, fontSize: 15, fontWeight: "800" }}>Nutrition locked in</Text>
+              <Text style={{ color: GREEN + "80", fontSize: 12 }}>All meals complete for today.</Text>
+            </View>
+          )}
+
+          {/* ── Completion button ─────────────────────────────────────────────── */}
+          <Pressable
+            onPress={() => {
+              if (!taskDone) {
+                // Mark all meals done visually, then complete
+                setCheckedMeals(new Set(plan.meals.map((m) => m.id)));
+                onCompleteTask(task.id);
+              } else {
+                onCompleteTask(task.id);
+                onClose();
+              }
+            }}
+            style={{
+              backgroundColor: taskDone ? "#0e0e0e" : NUTRITION_COLOR,
+              borderWidth: 1,
+              borderColor: taskDone ? "#1e1e1e" : NUTRITION_COLOR,
+              borderRadius: 14,
+              paddingVertical: 16,
+              alignItems: "center",
+            }}
+          >
+            <Text style={{
+              color: taskDone ? "#444" : "#fff",
+              fontSize: 15,
+              fontWeight: "800",
+              letterSpacing: 0.2,
+            }}>
+              {taskDone ? "Mark incomplete" : "Meals complete"}
+            </Text>
+          </Pressable>
+
+        </ScrollView>
+      </SafeAreaView>
+    </Modal>
+  );
+}
+
 // ---------- Task Detail Modal ----------
 function TaskDetailModal({
   task,
@@ -2215,8 +2670,9 @@ export default function Index() {
   // persistence — false until the initial AsyncStorage load completes
   const [loaded, setLoaded] = useState(false);
   const [showMotivation, setShowMotivation] = useState(false);
-  const [detailTask,  setDetailTask]  = useState<TimedTask | null>(null);
-  const [workoutTask, setWorkoutTask] = useState<TimedTask | null>(null);
+  const [detailTask,     setDetailTask]     = useState<TimedTask | null>(null);
+  const [workoutTask,    setWorkoutTask]    = useState<TimedTask | null>(null);
+  const [nutritionTask,  setNutritionTask]  = useState<TimedTask | null>(null);
 
   // profile/auth
   const [authed, setAuthed] = useState(false);
@@ -3378,7 +3834,8 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
                 task={task}
                 onToggle={() => toggleTask(task.id)}
                 onDetail={() => {
-                  if (task.kind === "Workout") setWorkoutTask(task);
+                  if (task.kind === "Workout")   setWorkoutTask(task);
+                  else if (task.kind === "Nutrition") setNutritionTask(task);
                   else setDetailTask(task);
                 }}
               />
@@ -4286,6 +4743,15 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
         visible={workoutTask !== null}
         onClose={() => setWorkoutTask(null)}
         onCompleteTask={(id) => toggleTaskById(id)}
+      />
+
+      {/* ---------- Nutrition detail modal ---------- */}
+      <NutritionDetailModal
+        task={nutritionTask}
+        taskDone={tasks.find((t) => t.id === nutritionTask?.id)?.done ?? false}
+        visible={nutritionTask !== null}
+        onClose={() => setNutritionTask(null)}
+        onCompleteTask={(id) => { toggleTaskById(id); }}
       />
 
       {/* ---------- Task detail modal ---------- */}
