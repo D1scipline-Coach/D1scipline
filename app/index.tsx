@@ -1774,49 +1774,60 @@ function TaskRow({
   onDetail: () => void;
 }) {
   const priority  = task.priority ?? "medium";
-  const accentBar = PRIORITY_LEFT_COLOR[priority] ?? "#2a2a2a";
+  const accentBar = task.done ? "#1e1e26" : (PRIORITY_LEFT_COLOR[priority] ?? "#2a2a2a");
+  const kindColor = KIND_COLORS[task.kind]?.color ?? "#555";
 
   return (
     <Pressable
       onPress={onDetail}
       style={{
-        backgroundColor: task.done ? "#0a0a0a" : "#0f0f0f",
+        backgroundColor: task.done ? "#0a0a0c" : "#0e0e16",
         borderWidth: 1,
-        borderColor: task.done ? "#1a1a1a" : "#1e1e1e",
+        borderColor: task.done ? "#161620" : "#222232",
         borderRadius: 14,
         flexDirection: "row",
         overflow: "hidden",
       }}
     >
       {/* Priority accent bar */}
-      <View style={{ width: 3, backgroundColor: task.done ? "#1e1e1e" : accentBar }} />
+      <View style={{ width: 3, backgroundColor: accentBar }} />
 
       {/* Content */}
-      <View style={{ flex: 1, paddingVertical: 14, paddingLeft: 14, paddingRight: 4, gap: 7 }}>
-        {/* Meta row: time · duration */}
-        <View style={{ flexDirection: "row", alignItems: "center" }}>
-          <Text style={{ color: task.done ? "#2a2a2a" : "#5a5a7a", fontSize: 11, fontWeight: "700", letterSpacing: 0.4 }}>
-            {task.timeText}
-          </Text>
-          {KIND_DURATION[task.kind] && (
-            <Text style={{ color: task.done ? "#222" : "#2e2e48", fontSize: 11, fontWeight: "500", marginLeft: 5 }}>
-              · {KIND_DURATION[task.kind]}
-            </Text>
-          )}
-        </View>
-
-        {/* Title */}
+      <View style={{ flex: 1, paddingVertical: 13, paddingLeft: 13, paddingRight: 4, gap: 5 }}>
+        {/* Title — primary */}
         <Text
           style={{
-            color: task.done ? "#373737" : "#ececef",
-            fontSize: 15,
+            color: task.done ? "#363640" : "#e8e8ee",
+            fontSize: 14,
             fontWeight: "700",
-            lineHeight: 21,
+            lineHeight: 20,
             textDecorationLine: task.done ? "line-through" : "none",
           }}
         >
           {task.title}
         </Text>
+
+        {/* Meta row: time · duration · kind */}
+        <View style={{ flexDirection: "row", alignItems: "center" }}>
+          <Text style={{ color: task.done ? "#28282e" : "#50507a", fontSize: 11, fontWeight: "600", letterSpacing: 0.2 }}>
+            {task.timeText}
+          </Text>
+          {KIND_DURATION[task.kind] && (
+            <Text style={{ color: task.done ? "#222" : "#3a3a55", fontSize: 11, fontWeight: "500" }}>
+              {" "}· {KIND_DURATION[task.kind]}
+            </Text>
+          )}
+          <View style={{ flex: 1 }} />
+          <Text style={{
+            color: task.done ? "#28282e" : kindColor + "88",
+            fontSize: 9,
+            fontWeight: "800",
+            letterSpacing: 1,
+            marginRight: 4,
+          }}>
+            {task.kind.toUpperCase()}
+          </Text>
+        </View>
       </View>
 
       {/* Completion toggle — separate pressable so it doesn't open detail */}
@@ -1829,14 +1840,14 @@ function TaskRow({
           width: 22,
           height: 22,
           borderRadius: 11,
-          borderWidth: 2,
-          borderColor: task.done ? "#66bb6a" : "#2a2a2a",
-          backgroundColor: task.done ? "#66bb6a18" : "transparent",
+          borderWidth: 1.5,
+          borderColor: task.done ? "#66bb6a" : "#2e2e42",
+          backgroundColor: task.done ? "#66bb6a14" : "transparent",
           alignItems: "center",
           justifyContent: "center",
         }}>
           {task.done && (
-            <Text style={{ color: "#66bb6a", fontSize: 12, fontWeight: "900", lineHeight: 14 }}>✓</Text>
+            <Text style={{ color: "#66bb6a", fontSize: 11, fontWeight: "900", lineHeight: 14 }}>✓</Text>
           )}
         </View>
       </Pressable>
@@ -3143,13 +3154,22 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
     // ── Loading ────────────────────────────────────────────────────────────────
     if (aiPlanLoading) {
       return (
-        <View style={{ flex: 1, justifyContent: "center", alignItems: "center", gap: 20 }}>
-          <View style={{ width: 56, height: 56, borderRadius: 28, borderWidth: 1, borderColor: ACCENT + "30", alignItems: "center", justifyContent: "center" }}>
+        <View style={{ flex: 1, justifyContent: "center", alignItems: "center", gap: 18 }}>
+          <View style={{
+            width: 52,
+            height: 52,
+            borderRadius: 26,
+            borderWidth: 1,
+            borderColor: ACCENT + "28",
+            backgroundColor: ACCENT + "08",
+            alignItems: "center",
+            justifyContent: "center",
+          }}>
             <ActivityIndicator color={ACCENT} size="small" />
           </View>
-          <View style={{ alignItems: "center", gap: 6 }}>
-            <Text style={{ color: "#ccc", fontSize: 15, fontWeight: "700" }}>Building your plan</Text>
-            <Text style={{ color: "#444", fontSize: 12, fontWeight: "500" }}>Personalising to your day…</Text>
+          <View style={{ alignItems: "center", gap: 5 }}>
+            <Text style={{ color: "#d0d0d8", fontSize: 15, fontWeight: "700" }}>Building your plan</Text>
+            <Text style={{ color: "#505060", fontSize: 12, fontWeight: "500" }}>Personalising to your day…</Text>
           </View>
         </View>
       );
@@ -3158,16 +3178,16 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
     return (
       <ScrollView
         style={{ flex: 1 }}
-        contentContainerStyle={{ paddingHorizontal: 2, paddingBottom: 48, gap: 0 }}
+        contentContainerStyle={{ paddingBottom: 56 }}
         showsVerticalScrollIndicator={false}
       >
 
         {/* ── Header ─────────────────────────────────────────────────────────── */}
-        <View style={{ paddingBottom: 24 }}>
-          <Text style={{ color: "#fff", fontSize: 32, fontWeight: "800", letterSpacing: -1 }}>Today</Text>
-          <Text style={{ color: "#666", fontSize: 12, fontWeight: "600", marginTop: 4, letterSpacing: 0.2 }}>{dateStr}</Text>
+        <View style={{ paddingBottom: 20 }}>
+          <Text style={{ color: "#fff", fontSize: 30, fontWeight: "800", letterSpacing: -0.5 }}>Today</Text>
+          <Text style={{ color: "#555", fontSize: 12, fontWeight: "600", marginTop: 3, letterSpacing: 0.2 }}>{dateStr}</Text>
           {profile?.name ? (
-            <Text style={{ color: "#4a4a6a", fontSize: 13, marginTop: 6, fontWeight: "500" }}>
+            <Text style={{ color: "#606075", fontSize: 13, marginTop: 5, fontWeight: "500" }}>
               {getGreeting()}, {profile.name}.
             </Text>
           ) : null}
@@ -3183,56 +3203,56 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
           <View style={{
             backgroundColor: "#09090f",
             borderWidth: 1,
-            borderColor: "#18182a",
-            borderRadius: 16,
-            padding: 20,
-            marginBottom: 16,
+            borderColor: "#20203a",
+            borderRadius: 18,
+            padding: 22,
+            marginBottom: 12,
           }}>
             <View style={{ flexDirection: "row", alignItems: "flex-end", justifyContent: "space-between" }}>
               {/* Score */}
-              <View style={{ gap: 5 }}>
+              <View style={{ gap: 6 }}>
                 <Text style={{
-                  color: effectiveScore >= 80 ? "#66bb6a" : "#fff",
-                  fontSize: 52,
+                  color: effectiveScore >= 80 ? "#66bb6a" : "#ffffff",
+                  fontSize: 54,
                   fontWeight: "900",
                   letterSpacing: -2,
-                  lineHeight: 52,
+                  lineHeight: 54,
                 }}>
                   {effectiveScore}
                 </Text>
-                <Text style={{ color: "#2e2e48", fontSize: 10, fontWeight: "800", letterSpacing: 1.2 }}>
+                <Text style={{ color: "#50507a", fontSize: 10, fontWeight: "800", letterSpacing: 1.2 }}>
                   DISCIPLINE SCORE
                 </Text>
               </View>
 
               {/* Streak */}
-              <View style={{ alignItems: "flex-end", gap: 5 }}>
+              <View style={{ alignItems: "flex-end", gap: 6 }}>
                 <Text style={{
-                  color: liveStreak > 0 ? ACCENT : "#252535",
-                  fontSize: 32,
+                  color: liveStreak > 0 ? ACCENT : "#30303e",
+                  fontSize: 34,
                   fontWeight: "900",
                   letterSpacing: -1,
-                  lineHeight: 32,
+                  lineHeight: 34,
                 }}>
                   {liveStreak}
                 </Text>
-                <Text style={{ color: "#2e2e48", fontSize: 10, fontWeight: "800", letterSpacing: 1.2 }}>
-                  {liveStreak === 1 ? "DAY STREAK" : "DAY STREAK"}
+                <Text style={{ color: "#50507a", fontSize: 10, fontWeight: "800", letterSpacing: 1.2 }}>
+                  DAY STREAK
                 </Text>
               </View>
             </View>
 
             {/* Progress bar */}
-            <View style={{ marginTop: 20, gap: 7 }}>
-              <View style={{ height: 2, backgroundColor: "#14142a", borderRadius: 1, overflow: "hidden" }}>
+            <View style={{ marginTop: 18, gap: 8 }}>
+              <View style={{ height: 3, backgroundColor: "#13132a", borderRadius: 2, overflow: "hidden" }}>
                 <View style={{
-                  height: 2,
+                  height: 3,
                   width: `${Math.round((doneCount / totalCount) * 100)}%` as any,
                   backgroundColor: allDone ? "#66bb6a" : ACCENT,
-                  borderRadius: 1,
+                  borderRadius: 2,
                 }} />
               </View>
-              <Text style={{ color: "#2a2a42", fontSize: 11, fontWeight: "600" }}>
+              <Text style={{ color: "#50506a", fontSize: 11, fontWeight: "600" }}>
                 {allDone
                   ? "All tasks complete"
                   : `${doneCount} of ${totalCount} complete`}
@@ -3246,72 +3266,72 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
           <Pressable
             onPress={() => setShowMotivation(true)}
             style={{
-              backgroundColor: gamePlan.color + "0d",
+              backgroundColor: gamePlan.color + "0a",
               borderWidth: 1,
-              borderColor: gamePlan.color + "28",
+              borderColor: gamePlan.color + "22",
               borderRadius: 14,
               padding: 14,
-              marginBottom: 20,
+              marginBottom: 12,
               flexDirection: "row",
               alignItems: "center",
               gap: 10,
             }}
           >
-            <View style={{ flex: 1, gap: 6 }}>
+            <View style={{ flex: 1, gap: 7 }}>
               <View style={{ flexDirection: "row", gap: 6 }}>
-                <View style={{ backgroundColor: gamePlan.color + "20", borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3 }}>
+                <View style={{ backgroundColor: gamePlan.color + "18", borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3 }}>
                   <Text style={{ color: gamePlan.color, fontSize: 10, fontWeight: "900", letterSpacing: 0.8 }}>
                     {gamePlan.readiness.toUpperCase()}
                   </Text>
                 </View>
-                <View style={{ backgroundColor: "#141414", borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3 }}>
-                  <Text style={{ color: "#666", fontSize: 10, fontWeight: "900", letterSpacing: 0.8 }}>
+                <View style={{ backgroundColor: "#181818", borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3 }}>
+                  <Text style={{ color: "#666", fontSize: 10, fontWeight: "800", letterSpacing: 0.8 }}>
                     {gamePlan.timeMode.toUpperCase()}
                   </Text>
                 </View>
               </View>
-              <Text style={{ color: "#bbb", fontSize: 13, lineHeight: 19, fontWeight: "500" }} numberOfLines={3}>
+              <Text style={{ color: "#aaa", fontSize: 13, lineHeight: 19, fontWeight: "500" }} numberOfLines={3}>
                 {gamePlan.message}
               </Text>
             </View>
-            <Text style={{ color: "#333", fontSize: 20 }}>›</Text>
+            <Text style={{ color: "#404050", fontSize: 18 }}>›</Text>
           </Pressable>
         ) : (
           <Pressable
             onPress={() => setShowMotivation(true)}
             style={{
-              backgroundColor: "#0c0c12",
+              backgroundColor: "#0b0b12",
               borderWidth: 1,
-              borderColor: "#1c1c2a",
+              borderColor: "#1a1a28",
               borderRadius: 14,
               padding: 14,
-              marginBottom: 20,
+              marginBottom: 12,
               flexDirection: "row",
               alignItems: "center",
               justifyContent: "space-between",
             }}
           >
-            <View style={{ gap: 3 }}>
-              <Text style={{ color: ACCENT, fontSize: 10, fontWeight: "900", letterSpacing: 0.8 }}>TODAY'S GAME PLAN</Text>
-              <Text style={{ color: "#444", fontSize: 13 }}>Complete check-in to set today's direction.</Text>
+            <View style={{ gap: 4 }}>
+              <Text style={{ color: ACCENT + "cc", fontSize: 10, fontWeight: "900", letterSpacing: 0.8 }}>TODAY'S GAME PLAN</Text>
+              <Text style={{ color: "#555", fontSize: 13 }}>Complete check-in to set today's direction.</Text>
             </View>
-            <Text style={{ color: ACCENT, fontSize: 20 }}>›</Text>
+            <Text style={{ color: ACCENT + "88", fontSize: 18 }}>›</Text>
           </Pressable>
         )}
 
         {/* ── Error state ─────────────────────────────────────────────────────── */}
         {aiPlanError && (
           <View style={{
-            backgroundColor: "#110808",
+            backgroundColor: "#100808",
             borderWidth: 1,
-            borderColor: "#2e1010",
+            borderColor: "#2a1010",
             borderRadius: 14,
             padding: 16,
-            marginBottom: 20,
+            marginBottom: 12,
             gap: 10,
           }}>
             <Text style={{ color: "#ff5252", fontSize: 10, fontWeight: "900", letterSpacing: 0.8 }}>PLAN ERROR</Text>
-            <Text style={{ color: "#aa6666", fontSize: 13, lineHeight: 19 }}>{aiPlanError}</Text>
+            <Text style={{ color: "#996060", fontSize: 13, lineHeight: 19 }}>{aiPlanError}</Text>
             <Pressable onPress={generateAIPlan}>
               <Text style={{ color: ACCENT, fontSize: 13, fontWeight: "700" }}>Try again →</Text>
             </Pressable>
@@ -3323,30 +3343,30 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
           <>
             {/* Day focus summary */}
             <View style={{
-              backgroundColor: "#0a0a12",
+              backgroundColor: "#09091a",
               borderWidth: 1,
-              borderColor: "#16162a",
+              borderColor: "#16162e",
               borderRadius: 14,
               padding: 16,
-              marginBottom: 20,
-              gap: 6,
+              marginBottom: 12,
+              gap: 7,
             }}>
-              <Text style={{ color: "#4a4a7a", fontSize: 10, fontWeight: "800", letterSpacing: 1 }}>TODAY'S FOCUS</Text>
-              <Text style={{ color: "#b0b0c0", fontSize: 14, lineHeight: 22, fontWeight: "500" }}>{effectivePlan.summary}</Text>
+              <Text style={{ color: "#5050a0", fontSize: 10, fontWeight: "800", letterSpacing: 1 }}>TODAY'S FOCUS</Text>
+              <Text style={{ color: "#a8a8c0", fontSize: 13, lineHeight: 21, fontWeight: "500" }}>{effectivePlan.summary}</Text>
             </View>
           </>
         )}
 
         {/* ── Task list ───────────────────────────────────────────────────────── */}
         {totalCount > 0 ? (
-          <View style={{ gap: 8, marginBottom: 28 }}>
+          <View style={{ gap: 7, marginBottom: 24 }}>
             {/* Section header */}
-            <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-              <Text style={{ color: "#2e2e48", fontSize: 10, fontWeight: "800", letterSpacing: 1 }}>
+            <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+              <Text style={{ color: "#50507a", fontSize: 10, fontWeight: "800", letterSpacing: 1 }}>
                 TODAY'S TASKS
               </Text>
               {pausedCount > 0 && (
-                <Text style={{ color: "#252535", fontSize: 10, fontWeight: "600" }}>
+                <Text style={{ color: "#3a3a55", fontSize: 10, fontWeight: "600" }}>
                   {pausedCount} paused · {gamePlan?.timeMode}
                 </Text>
               )}
@@ -3367,14 +3387,14 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
           </View>
         ) : (
           /* ── Empty state ──────────────────────────────────────────────────── */
-          <View style={{ alignItems: "center", paddingTop: 40, paddingBottom: 48, gap: 14 }}>
+          <View style={{ alignItems: "center", paddingTop: 48, paddingBottom: 48, gap: 16 }}>
             <View style={{
               width: 56,
               height: 56,
               borderRadius: 28,
               borderWidth: 1,
-              borderColor: ACCENT + "28",
-              backgroundColor: ACCENT + "08",
+              borderColor: ACCENT + "22",
+              backgroundColor: ACCENT + "06",
               alignItems: "center",
               justifyContent: "center",
             }}>
@@ -3422,31 +3442,31 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
 
         {/* ── Coaching note + fallback ────────────────────────────────────────── */}
         {effectivePlan && (
-          <View style={{ gap: 10, marginTop: 8 }}>
+          <View style={{ gap: 8, marginTop: 4 }}>
             {/* Coaching note card */}
             <View style={{
               backgroundColor: "#09090f",
               borderWidth: 1,
-              borderColor: "#14142a",
+              borderColor: "#18182e",
               borderRadius: 14,
-              padding: 16,
-              gap: 6,
+              padding: 15,
+              gap: 7,
             }}>
-              <Text style={{ color: "#4a4a7a", fontSize: 10, fontWeight: "800", letterSpacing: 1 }}>COACHING NOTE</Text>
-              <Text style={{ color: "#9090a8", fontSize: 13, lineHeight: 20, fontWeight: "500" }}>{effectivePlan.coachingNote}</Text>
+              <Text style={{ color: "#5050a0", fontSize: 10, fontWeight: "800", letterSpacing: 1 }}>COACHING NOTE</Text>
+              <Text style={{ color: "#8888a8", fontSize: 13, lineHeight: 20, fontWeight: "500" }}>{effectivePlan.coachingNote}</Text>
             </View>
 
             {/* Fallback card */}
             <View style={{
-              backgroundColor: "#080808",
+              backgroundColor: "#08080c",
               borderWidth: 1,
-              borderColor: "#111",
+              borderColor: "#141420",
               borderRadius: 14,
-              padding: 16,
-              gap: 6,
+              padding: 15,
+              gap: 7,
             }}>
-              <Text style={{ color: "#3a3a5a", fontSize: 10, fontWeight: "800", letterSpacing: 1 }}>IF THE DAY FALLS APART</Text>
-              <Text style={{ color: "#585870", fontSize: 13, lineHeight: 20, fontStyle: "italic" }}>{effectivePlan.fallbackPlan}</Text>
+              <Text style={{ color: "#40405a", fontSize: 10, fontWeight: "800", letterSpacing: 1 }}>IF THE DAY FALLS APART</Text>
+              <Text style={{ color: "#505065", fontSize: 13, lineHeight: 20, fontStyle: "italic" }}>{effectivePlan.fallbackPlan}</Text>
             </View>
 
           </View>
@@ -3479,8 +3499,8 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
 
         {/* ── Regenerate nudge when plan exists ─────────────────────────────── */}
         {effectivePlan && !isMockActive && totalCount > 0 && (
-          <Pressable onPress={generateAIPlan} style={{ alignSelf: "flex-start", paddingVertical: 4, marginTop: 4 }}>
-            <Text style={{ color: "#252535", fontSize: 12, fontWeight: "700" }}>Regenerate plan →</Text>
+          <Pressable onPress={generateAIPlan} style={{ alignSelf: "flex-start", paddingVertical: 6, marginTop: 6 }}>
+            <Text style={{ color: "#383848", fontSize: 12, fontWeight: "700" }}>Regenerate plan →</Text>
           </Pressable>
         )}
       </ScrollView>
