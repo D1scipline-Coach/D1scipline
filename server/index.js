@@ -344,41 +344,67 @@ If you must ask: one question, at the end, after the guidance. Never more than o
 // Validates AI output before storing anything — never persists raw AI text.
 // ─────────────────────────────────────────────────────────────
 app.post("/api/planner/generate", async (req, res) => {
+  // Route-level safety net — every exit path from this handler must return JSON.
+  // Do NOT use status 502 here: Render's reverse proxy intercepts 502 from the
+  // backend and replaces the response body with its own HTML error page, which
+  // the client cannot parse as JSON. Use 500 for all internal failures.
   try {
+    console.log("[planner/generate] route hit");
+
     const { userId, profile, schedule, condition, behavior, context } = req.body || {};
+
+    console.log("[planner/generate] payload check — userId present:", !!userId, "profile present:", !!profile);
 
     if (!userId)  return res.status(400).json({ error: "Missing userId" });
     if (!profile) return res.status(400).json({ error: "Missing profile" });
 
     const date = context?.date ?? new Date().toISOString().slice(0, 10);
-    console.log(`[planner/generate] userId=${String(userId).slice(0, 8)}… date=${date} energy=${condition?.energyLevel ?? "?"} readiness=${context?.gamePlan?.readiness ?? "none"}`);
+    console.log(`[planner/generate] userId=${String(userId).slice(0, 8)}… date=${date} energy=${condition?.energyLevel ?? "?"} readiness=${context?.gamePlan?.readiness ?? "none"} scheduleBlocks=${schedule?.blocks?.length ?? 0}`);
 
     const systemPrompt = buildPlannerSystemPrompt({ profile, schedule, condition, behavior, context });
+    console.log("[planner/generate] system prompt built, length:", systemPrompt.length);
 
     // Call AI with JSON mode enforced
-    const completion = await client.chat.completions.create({
-      model:           "gpt-4o-mini",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user",   content: "Generate today's plan." },
-      ],
-      temperature:     0.5,
-      response_format: { type: "json_object" },
-    });
+    console.log("[planner/generate] calling OpenAI gpt-4o-mini...");
+    let completion;
+    try {
+      completion = await client.chat.completions.create({
+        model:           "gpt-4o-mini",
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user",   content: "Generate today's plan." },
+        ],
+        temperature:     0.5,
+        response_format: { type: "json_object" },
+      });
+    } catch (aiErr) {
+      console.error("[planner/generate] OpenAI API call failed:", aiErr?.message ?? aiErr, "status:", aiErr?.status);
+      return res.status(500).json({ error: "AI call failed — please try again.", details: String(aiErr?.message ?? aiErr) });
+    }
 
     const rawText = completion.choices?.[0]?.message?.content?.trim() ?? "{}";
+    console.log(`[planner/generate] AI responded, rawText length: ${rawText.length}`);
 
     let raw;
     try {
       raw = JSON.parse(rawText);
     } catch {
-      console.error("[planner/generate] AI returned malformed JSON. Raw length:", rawText.length);
-      return res.status(502).json({ error: "AI returned malformed JSON — please try again." });
+      console.error("[planner/generate] AI returned malformed JSON. First 200 chars:", rawText.slice(0, 200));
+      return res.status(500).json({ error: "AI returned malformed JSON — please try again." });
     }
 
-    // Normalize task kinds before validation — AI occasionally returns variants (e.g. "meal", "stretch")
+    // Log raw task kinds before normalization
     if (raw && Array.isArray(raw.tasks)) {
+      const rawKinds = raw.tasks.map((t) => t?.kind ?? "(missing)");
+      console.log("[planner/generate] raw task kinds from AI:", JSON.stringify(rawKinds));
+
+      // Normalize task kinds — AI occasionally returns variants (e.g. "meal", "stretch")
       raw.tasks = raw.tasks.map((t) => ({ ...t, kind: normalizeTaskKind(t.kind) }));
+
+      const normalizedKinds = raw.tasks.map((t) => t?.kind ?? "(missing)");
+      console.log("[planner/generate] normalized task kinds:", JSON.stringify(normalizedKinds));
+    } else {
+      console.warn("[planner/generate] raw.tasks is missing or not an array — raw keys:", Object.keys(raw ?? {}));
     }
 
     // Validate AI output before touching storage — raw AI text never enters the store
@@ -386,10 +412,11 @@ app.post("/api/planner/generate", async (req, res) => {
     if (!parsed.success) {
       const detail = parsed.error.issues.map((e) => `${e.path.join(".")}: ${e.message}`).join("; ");
       console.error("[planner/generate] schema validation failed:", detail);
-      return res.status(502).json({ error: "AI output failed validation", details: detail });
+      // Use 500, NOT 502 — Render replaces 502 response bodies with its own HTML error page
+      return res.status(500).json({ error: "AI output failed validation — please try again.", details: detail });
     }
     const validated = parsed.data;
-    console.log(`[planner/generate] AI output valid — ${validated.tasks.length} tasks`);
+    console.log(`[planner/generate] schema validation passed — ${validated.tasks.length} tasks, kinds: ${JSON.stringify(validated.tasks.map((t) => t.kind))}`);
 
     // Build the plan record
     const planId = crypto.randomUUID();
@@ -412,8 +439,8 @@ app.post("/api/planner/generate", async (req, res) => {
       date,
       timeText:    sanitize(t.timeText, 20),
       title:       sanitize(t.title, 200),
-      kind:        t.kind,      // already validated
-      priority:    t.priority,  // already validated
+      kind:        t.kind,
+      priority:    t.priority,
       rationale:   sanitize(t.rationale, 300),
       done:        false,
       completedAt: null,
@@ -426,6 +453,7 @@ app.post("/api/planner/generate", async (req, res) => {
         if (task.planId === prevPlanId) dailyTasks.delete(tid);
       }
       dailyPlans.delete(prevPlanId);
+      console.log(`[planner/generate] replaced previous planId=${prevPlanId}`);
     }
 
     // Persist to in-memory store
@@ -433,11 +461,15 @@ app.post("/api/planner/generate", async (req, res) => {
     for (const task of tasks) dailyTasks.set(task.id, task);
     userDayPlan.set(`${userId}:${date}`, planId);
 
-    console.log(`[planner/generate] plan stored planId=${planId}`);
-    return res.json({ plan, tasks });
+    console.log(`[planner/generate] success — planId=${planId} tasks=${tasks.length}`);
+    return res.status(201).json({ plan, tasks });
   } catch (err) {
-    console.error("[planner/generate] unexpected error:", err);
-    return res.status(500).json({ error: "Server error", details: String(err?.message ?? err) });
+    // Catch anything that escaped the inner try blocks
+    console.error("[planner/generate] unhandled error:", err?.message ?? err, err?.stack ?? "");
+    // Guard against double-send (e.g. if res was already partially committed)
+    if (!res.headersSent) {
+      return res.status(500).json({ error: "Unexpected server error — please try again.", details: String(err?.message ?? err) });
+    }
   }
 });
 
@@ -489,8 +521,21 @@ app.patch("/api/planner/task/:taskId/complete", (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
+// Global error handler — 4-argument signature required by Express.
+// Catches any error forwarded via next(err) or unhandled async throws
+// in Express 5. Always returns JSON — never HTML.
+// Must be registered BEFORE the 404 catch-all.
+// ─────────────────────────────────────────────────────────────
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  console.error("[server] unhandled error:", err?.message ?? err, err?.stack ?? "");
+  if (res.headersSent) return;
+  res.status(500).json({ error: "Internal server error", details: String(err?.message ?? err) });
+});
+
+// ─────────────────────────────────────────────────────────────
 // Catch-all 404 — always returns JSON so the client can parse it.
-// Must be registered after all routes.
+// Must be registered after all routes and the error handler.
 // ─────────────────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ error: `Cannot ${req.method} ${req.path}` });
