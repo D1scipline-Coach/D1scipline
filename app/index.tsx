@@ -6,6 +6,7 @@ import { getAccessToken, loadSession, signOut as authSignOut, type AuthUser } fr
 import { loadUserData, saveUserData } from "../lib/db";
 import {
   ActivityIndicator,
+  Animated,
   Alert,
   FlatList,
   KeyboardAvoidingView,
@@ -133,6 +134,31 @@ type AIPlan = {
   disciplineTarget: string;
   fallbackPlan:     string;
   generatedAt:      string;   // ISO timestamp
+};
+
+// ---------- Workout session types ----------
+// V1 data structure — ready for planner-linked data when the backend supports it.
+// Replace getWorkoutForTask() to connect to real data without touching this schema.
+type ExerciseSet = {
+  set_number:    number;
+  reps:          number;
+  target_weight: string | null; // e.g. "80kg", "bodyweight", null = not prescribed
+};
+
+type WorkoutExercise = {
+  id:           string;
+  name:         string;
+  sets:         ExerciseSet[];
+  rest_seconds: number;
+  cue:          string;
+};
+
+type WorkoutSession = {
+  workout_id:       string;
+  title:            string;
+  duration_minutes: number;
+  focus:            string;     // e.g. "Chest, Shoulders & Triceps"
+  exercises:        WorkoutExercise[];
 };
 
 type TabKey = "Today" | "Schedule" | "Chat" | "Progress" | "Settings";
@@ -334,23 +360,142 @@ function buildTodaysPlan(params: {
   return spread;
 }
 
-// Point value per priority level — used by calcScore and available for future
-// weekly summaries, streak bonuses, and coaching feedback.
-const PRIORITY_POINTS: Record<TaskPriority, number> = { high: 10, medium: 5, low: 2 };
+// V1 Discipline Score — flat-point system tied to daily execution.
+//
+// Required tasks (high priority):  +15 pts each
+// Optional tasks (medium/low):     +5 pts each
+// All-required-complete bonus:     +10 pts
+// Cap:                             100 pts
+//
+// "Required" = high priority tasks the AI flagged as non-negotiable for the day.
+// Modular: swap point values or add bonuses here without touching UI or state.
+const SCORE_POINTS = {
+  required: 15,   // high priority task completed
+  optional:  5,   // medium or low priority task completed
+  allRequiredBonus: 10,
+  cap: 100,
+} as const;
 
-// Priority-weighted score: each task contributes its PRIORITY_POINTS value.
-// high=10, medium=5, low=2 — missing a high task costs ~2× a medium task.
-// Called with rebalancedTasks so demoted tasks are scored at their adjusted
-// weight, not their original weight (completing a rebalanced workout = valid win).
 function calcScore(tasks: TimedTask[]): number {
   if (!tasks.length) return 0;
-  const maxPts    = tasks.reduce((sum, t) => sum + PRIORITY_POINTS[t.priority ?? "medium"], 0);
-  if (maxPts === 0) return 0;
-  const earnedPts = tasks
-    .filter((t) => t.done)
-    .reduce((sum, t) => sum + PRIORITY_POINTS[t.priority ?? "medium"], 0);
-  return Math.round((earnedPts / maxPts) * 100);
+
+  const required = tasks.filter((t) => (t.priority ?? "medium") === "high");
+  const optional = tasks.filter((t) => (t.priority ?? "medium") !== "high");
+
+  const requiredDone = required.filter((t) => t.done);
+  const optionalDone = optional.filter((t) => t.done);
+
+  let pts = requiredDone.length * SCORE_POINTS.required
+          + optionalDone.length * SCORE_POINTS.optional;
+
+  if (required.length > 0 && requiredDone.length === required.length) {
+    pts += SCORE_POINTS.allRequiredBonus;
+  }
+
+  return Math.min(pts, SCORE_POINTS.cap);
 }
+
+// ─── Dev Mock Planner Data ───────────────────────────────────────────────────
+// Renders the Today screen with sample data when no real plan is available.
+// Only activates in __DEV__ builds. Set DEV_MOCK_ENABLED = false to disable.
+// Remove this entire block when mock data is no longer needed.
+const DEV_MOCK_ENABLED = true;
+
+const DEV_MOCK_PLAN: AIPlan = {
+  id:               "dev-mock-plan",
+  date:             new Date().toISOString().slice(0, 10),
+  summary:          "Strength focus day. Hit your workout early, keep nutrition on point, and close the day with a solid sleep routine.",
+  coachingNote:     "You don't need to feel motivated to start — you need to start to feel motivated. One task at a time.",
+  disciplineTarget: "Complete all three required tasks before 6 PM.",
+  fallbackPlan:     "If the day falls apart: 10 minutes of mobility, one solid meal, and 8 hours of sleep. That's enough.",
+  generatedAt:      new Date().toISOString(),
+};
+
+const DEV_MOCK_TASKS: TimedTask[] = [
+  { id: "mock_t0", timeMin: 360,  timeText: "6:00 AM",  title: "Morning workout — push A",          kind: "Workout",   priority: "high",   done: false },
+  { id: "mock_t1", timeMin: 480,  timeText: "8:00 AM",  title: "High-protein breakfast",             kind: "Nutrition", priority: "high",   done: false },
+  { id: "mock_t2", timeMin: 720,  timeText: "12:00 PM", title: "Midday walk — 20 minutes",           kind: "Mobility",  priority: "medium", done: false },
+  { id: "mock_t3", timeMin: 780,  timeText: "1:00 PM",  title: "Lunch — lean protein + vegetables", kind: "Nutrition", priority: "medium", done: false },
+  { id: "mock_t4", timeMin: 1080, timeText: "6:00 PM",  title: "Hydration — hit 3L today",           kind: "Hydration", priority: "low",    done: false },
+  { id: "mock_t5", timeMin: 1320, timeText: "10:00 PM", title: "Wind-down & sleep by 10:30",         kind: "Sleep",     priority: "high",   done: false },
+];
+// ─── Dev Mock Workout Data ───────────────────────────────────────────────────
+// Full workout session used when no planner-linked workout exists.
+// Replace getWorkoutForTask() below to swap in real data — no other changes needed.
+const DEV_MOCK_WORKOUT: WorkoutSession = {
+  workout_id:       "mock-push-a",
+  title:            "Push A — Chest, Shoulders & Triceps",
+  duration_minutes: 45,
+  focus:            "Chest, Shoulders & Triceps",
+  exercises: [
+    {
+      id: "ex1",
+      name: "Barbell Bench Press",
+      sets: [
+        { set_number: 1, reps: 8,  target_weight: "60kg" },
+        { set_number: 2, reps: 8,  target_weight: "70kg" },
+        { set_number: 3, reps: 6,  target_weight: "80kg" },
+        { set_number: 4, reps: 6,  target_weight: "80kg" },
+      ],
+      rest_seconds: 90,
+      cue: "Control the descent — 3 seconds down, drive up explosively. Keep shoulder blades pinched.",
+    },
+    {
+      id: "ex2",
+      name: "Incline Dumbbell Press",
+      sets: [
+        { set_number: 1, reps: 10, target_weight: "24kg" },
+        { set_number: 2, reps: 10, target_weight: "28kg" },
+        { set_number: 3, reps: 8,  target_weight: "28kg" },
+      ],
+      rest_seconds: 75,
+      cue: "Slight arch, elbows at 45°. Full stretch at the bottom — don't bounce.",
+    },
+    {
+      id: "ex3",
+      name: "Overhead Press",
+      sets: [
+        { set_number: 1, reps: 10, target_weight: "40kg" },
+        { set_number: 2, reps: 8,  target_weight: "45kg" },
+        { set_number: 3, reps: 8,  target_weight: "45kg" },
+      ],
+      rest_seconds: 90,
+      cue: "Bar path should travel straight up — tuck your chin on the way, push your face through at the top.",
+    },
+    {
+      id: "ex4",
+      name: "Cable Lateral Raise",
+      sets: [
+        { set_number: 1, reps: 15, target_weight: "8kg" },
+        { set_number: 2, reps: 15, target_weight: "8kg" },
+        { set_number: 3, reps: 12, target_weight: "10kg" },
+      ],
+      rest_seconds: 60,
+      cue: "Lead with your elbows, not your wrists. Pause at the top for one second.",
+    },
+    {
+      id: "ex5",
+      name: "Tricep Pushdown",
+      sets: [
+        { set_number: 1, reps: 15, target_weight: null },
+        { set_number: 2, reps: 15, target_weight: null },
+        { set_number: 3, reps: 12, target_weight: null },
+      ],
+      rest_seconds: 60,
+      cue: "Keep elbows pinned to your sides. Full lockout at the bottom — squeeze and hold.",
+    },
+  ],
+};
+
+/**
+ * Resolve a TimedTask to a WorkoutSession.
+ * V1: always returns the mock session. When the backend supplies planner-linked
+ * workouts, fetch/look up by task.id or task.planId here — no other code changes.
+ */
+function getWorkoutForTask(_task: TimedTask): WorkoutSession {
+  return DEV_MOCK_WORKOUT;
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 // ---------- Game Plan ----------
 //
@@ -555,153 +700,6 @@ const KIND_COLORS: Partial<Record<TaskKind, { color: string; borderColor: string
   Sleep:     { color: "#90a4ae", borderColor: "#2e3f47", backgroundColor: "#0a1015" },
 };
 
-// ---------- Movement library ----------
-const WORKOUT_KINDS: Partial<
-  Record<
-    TaskKind,
-    { name: string; explanation: string; steps?: string[]; cues: string[]; mistake: string }
-  >
-> = {
-  Workout: {
-    name: "Workout",
-    explanation:
-      "A focused training session to build discipline and physique. Prioritize compound movements and consistent effort.",
-    steps: [
-      "Warm up for 3–5 min — light cardio or dynamic stretching",
-      "Start with your heaviest compound movement while fresh",
-      "Work through your accessory lifts at controlled tempo",
-      "Finish with a 2–3 min cooldown stretch",
-    ],
-    cues: [
-      "Full range of motion over heavy weight — always",
-      "Control the eccentric (lowering) phase of each rep",
-      "Keep rest periods tight — 60–90 seconds between sets",
-      "Track reps and weight — if it's not logged, it didn't happen",
-    ],
-    mistake:
-      "Skipping the warm-up or going too heavy too fast — this leads to injury and poor form.",
-  },
-  Walk: {
-    name: "Brisk Walk",
-    explanation:
-      "A steady-paced walk that elevates your heart rate slightly. Focus on posture and breathing rhythm.",
-    cues: [
-      "Keep chest up, shoulders relaxed and back",
-      "Swing arms naturally at your sides",
-      "Land heel-to-toe with each step",
-      "Breathe in for 3 steps, out for 3",
-    ],
-    mistake:
-      "Slouching or looking down at your phone — keep your gaze ahead and spine tall.",
-  },
-  Recovery: {
-    name: "Recovery Block",
-    explanation:
-      "Active recovery reduces soreness and primes your body for the next session. Light movement and deliberate rest beat doing nothing.",
-    steps: [
-      "Start with 5 slow diaphragmatic breaths to downregulate the nervous system",
-      "Foam roll the main muscle groups worked today — 30–60 sec per area",
-      "Follow with light static stretching on the tightest areas",
-      "End with 2–3 min of stillness or light walking",
-    ],
-    cues: [
-      "Keep intensity very low — this is not a workout",
-      "Focus on areas worked in today's training",
-      "Pain is a stop signal — discomfort from tightness is fine, sharp pain is not",
-    ],
-    mistake:
-      "Skipping recovery because you feel fine — soreness often peaks 24–48 hours after training.",
-  },
-  Mobility: {
-    name: "Mobility & Stretch",
-    explanation:
-      "A short movement flow to improve range of motion and reduce stiffness. Consistency here compounds over weeks.",
-    steps: [
-      "Start with a 60-second hip flexor stretch each side",
-      "Move to a thoracic rotation — 10 slow reps each side",
-      "Add a doorframe chest stretch — 30 seconds",
-      "Finish with a hamstring stretch — 30 seconds each side",
-    ],
-    cues: [
-      "Move slowly into each position — never force a stretch",
-      "Hold each position for 20–30 seconds minimum",
-      "Breathe out as you deepen into a stretch",
-      "Focus on the tightest areas: hips, chest, and shoulders",
-    ],
-    mistake:
-      "Bouncing or rushing through stretches — slow, controlled holds create lasting change.",
-  },
-  Nutrition: {
-    name: "Nutrition Task",
-    explanation:
-      "Fuelling correctly is as important as the training itself. A well-timed, well-composed meal drives recovery, energy, and physique progress.",
-    steps: [
-      "Build the plate around a protein source first (chicken, beef, eggs, fish)",
-      "Add complex carbohydrates — rice, oats, potatoes — proportional to training demand",
-      "Include vegetables or fibre to slow digestion and support satiety",
-      "Eat slowly — 15–20 minutes per meal lets hunger signals register properly",
-    ],
-    cues: [
-      "Protein first — hit your target grams before filling up on anything else",
-      "Prep protein sources in advance to make targets easier to hit",
-      "Track meals before eating, not after — plan determines the outcome",
-    ],
-    mistake:
-      "Skipping meals or under-eating protein — this leads to muscle loss, low energy, and stalled progress regardless of how hard you train.",
-  },
-  Hydration: {
-    name: "Hydration Block",
-    explanation:
-      "Hydration directly affects energy, focus, muscle function, and recovery. Even mild dehydration reduces performance and mental clarity.",
-    steps: [
-      "Drink 16oz (500ml) of water — do it now, don't sip it over an hour",
-      "If this is your morning block, drink before any coffee",
-      "Add a small pinch of salt if you trained hard or sweated heavily today",
-    ],
-    cues: [
-      "Keep a water bottle visible — out of sight means out of mind",
-      "Urine should be light yellow — clear is over-hydrated, dark means drink more",
-      "Coffee counts but doesn't fully offset water needs",
-    ],
-    mistake:
-      "Waiting until you feel thirsty — thirst is a late dehydration signal. Drink before you need it.",
-  },
-  Habit: {
-    name: "Habit Task",
-    explanation:
-      "Habits are the system underneath the goal. Each completion builds a neurological pattern that makes the behaviour progressively more automatic.",
-    steps: [
-      "Start at the scheduled time — no negotiation, no delay",
-      "Execute even at reduced effort if energy is low — partial reps beat skipping",
-      "Mark it done immediately — the act of completion reinforces the identity",
-    ],
-    cues: [
-      "Stack it onto an existing anchor: after coffee, after brushing teeth",
-      "Remove friction the night before — lay out what you need in advance",
-      "Never miss twice — one miss is an accident, two is a pattern",
-    ],
-    mistake:
-      "Waiting for motivation before starting — discipline is the system, motivation is a bonus when it shows up.",
-  },
-  Sleep: {
-    name: "Sleep Wind-Down",
-    explanation:
-      "Sleep is when the body repairs muscle, consolidates learning, and resets hormones. Poor sleep undermines every other investment you make in training and discipline.",
-    steps: [
-      "Dim lights and reduce screen brightness 60 minutes before your target sleep time",
-      "Put devices in another room or switch to Do Not Disturb",
-      "Do a brief wind-down: light stretching, reading, or slow breathing",
-      "Get into bed at a consistent time — your body clock responds to regularity",
-    ],
-    cues: [
-      "Keep the room cool — 65–68°F (18–20°C) is optimal for sleep quality",
-      "No food within 90 minutes of sleep — digestion disrupts sleep stages",
-      "If you can't sleep within 20 minutes, get up briefly rather than lying frustrated",
-    ],
-    mistake:
-      "Staying on your phone 'just 5 more minutes' — blue light and content stimulation push sleep onset back by 30–60 minutes.",
-  },
-};
 
 // ---------- Nutrition guidance ----------
 type NutritionGuide = { protein: string; hydration: string; priority: string };
@@ -881,32 +879,66 @@ function SmallButton({ title, onPress }: { title: string; onPress: () => void })
 }
 
 function Splash() {
+  const fadeAnim = React.useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    Animated.timing(fadeAnim, {
+      toValue: 1,
+      duration: 480,
+      useNativeDriver: true,
+    }).start();
+  }, []);
+
   return (
     <View style={{ flex: 1, backgroundColor: "#000", alignItems: "center", justifyContent: "center" }}>
-      <StatusBar barStyle="light-content" />
-      <View style={{ alignItems: "center", gap: 16 }}>
-        {/* Logo mark */}
+      <StatusBar barStyle="light-content" backgroundColor="#000" />
+
+      <Animated.View style={{ alignItems: "center", opacity: fadeAnim }}>
+        {/* Icon mark */}
         <View style={{
-          width: 72,
-          height: 72,
+          width: 76,
+          height: 76,
           borderRadius: 22,
-          backgroundColor: ACCENT + "12",
+          backgroundColor: "#0a0a14",
           borderWidth: 1,
-          borderColor: ACCENT + "35",
+          borderColor: ACCENT + "28",
           alignItems: "center",
           justifyContent: "center",
+          marginBottom: 28,
+          shadowColor: ACCENT,
+          shadowOpacity: 0.18,
+          shadowRadius: 24,
+          shadowOffset: { width: 0, height: 0 },
         }}>
-          <Text style={{ color: ACCENT, fontSize: 32, fontWeight: "900", letterSpacing: -1 }}>A</Text>
+          <Text style={{ color: ACCENT, fontSize: 34, fontWeight: "900", letterSpacing: -1 }}>A</Text>
         </View>
 
         {/* Wordmark */}
-        <View style={{ alignItems: "center", gap: 6 }}>
-          <Text style={{ color: "#fff", fontSize: 28, fontWeight: "900", letterSpacing: 4 }}>AIRA</Text>
-          <Text style={{ color: "#2a2a2a", fontSize: 11, fontWeight: "700", letterSpacing: 2.5 }}>
-            DISCIPLINE ENGINE
-          </Text>
+        <Text style={{
+          color: "#ffffff",
+          fontSize: 26,
+          fontWeight: "900",
+          letterSpacing: 6,
+          marginBottom: 8,
+        }}>
+          AIRA
+        </Text>
+
+        {/* Tagline */}
+        <Text style={{
+          color: "#3a3a55",
+          fontSize: 10,
+          fontWeight: "700",
+          letterSpacing: 3,
+        }}>
+          DISCIPLINE ENGINE
+        </Text>
+
+        {/* Loading indicator */}
+        <View style={{ marginTop: 52 }}>
+          <ActivityIndicator size="small" color="#2a2a40" />
         </View>
-      </View>
+      </Animated.View>
     </View>
   );
 }
@@ -927,22 +959,826 @@ const KIND_DURATION: Partial<Record<TaskKind, string>> = {
   Sleep:     "8 hr",
 };
 
+// ---------- Workout Detail Modal ----------
+function WorkoutDetailModal({
+  task,
+  taskDone,
+  visible,
+  onClose,
+  onCompleteTask,
+}: {
+  task:            TimedTask | null;
+  taskDone:        boolean;          // live from global tasks — never stale
+  visible:         boolean;
+  onClose:         () => void;
+  onCompleteTask:  (id: string) => void;
+}) {
+  const [completedIds, setCompletedIds] = React.useState<Set<string>>(new Set());
+
+  // Scroll refs — cardYRef stores each card's Y within the list container;
+  // listContainerYRef stores the list container's Y within the ScrollView.
+  // Together they give the absolute scroll offset for any card.
+  const scrollViewRef      = React.useRef<ScrollView>(null);
+  const cardYRef           = React.useRef<Record<string, number>>({});
+  const listContainerYRef  = React.useRef(0);
+
+  const workout        = task ? getWorkoutForTask(task) : null;
+  const totalExercises = workout?.exercises.length ?? 0;
+
+  // When the modal opens:
+  //   - if the task is already done, pre-fill all exercises so the
+  //     completion summary is shown immediately instead of an empty list.
+  //   - otherwise start fresh.
+  React.useEffect(() => {
+    if (!visible || !workout) return;
+    if (taskDone) {
+      setCompletedIds(new Set(workout.exercises.map((e) => e.id)));
+    } else {
+      setCompletedIds(new Set());
+    }
+  }, [visible]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const doneCount   = completedIds.size;
+  const allDone     = doneCount === totalExercises && totalExercises > 0;
+
+  // Auto-complete the task the moment all exercises are ticked off.
+  // Fires at most once per session — the taskDone guard prevents re-firing
+  // after the parent state update propagates back through the taskDone prop.
+  React.useEffect(() => {
+    if (allDone && !taskDone && task) {
+      onCompleteTask(task.id);
+    }
+  }, [allDone]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Auto-scroll to the newly active exercise after layout settles.
+  // The timeout lets the layout reflow (card expand/collapse) complete first.
+  const activeId = workout?.exercises.find((e) => !completedIds.has(e.id))?.id ?? null;
+
+  React.useEffect(() => {
+    if (!activeId || allDone) return;
+    const timer = setTimeout(() => {
+      const cardY = cardYRef.current[activeId];
+      if (cardY == null) return;
+      const scrollY = listContainerYRef.current + cardY;
+      scrollViewRef.current?.scrollTo({ y: Math.max(0, scrollY - 24), animated: true });
+    }, 80);
+    return () => clearTimeout(timer);
+  }, [activeId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  if (!task || !workout) return null;
+
+  const progressPct = totalExercises > 0 ? Math.round((doneCount / totalExercises) * 100) : 0;
+
+  // The exercise immediately after active — shown with "NEXT" pill
+  const activeIndex = workout.exercises.findIndex((e) => e.id === activeId);
+  const nextId      = activeIndex >= 0 && activeIndex + 1 < workout.exercises.length
+    ? workout.exercises[activeIndex + 1].id
+    : null;
+  const isLastExercise = activeIndex === workout.exercises.length - 1;
+
+  const markDone = (id: string) =>
+    setCompletedIds((prev) => new Set([...prev, id]));
+
+  function formatRest(seconds: number): string {
+    if (seconds >= 60) {
+      const m = Math.floor(seconds / 60);
+      const s = seconds % 60;
+      return s > 0 ? `${m}m ${s}s` : `${m}m`;
+    }
+    return `${seconds}s`;
+  }
+
+  // One-line summary for upcoming exercises: "4 sets · 8 reps · 80kg"
+  function summarizeSets(sets: ExerciseSet[]): string {
+    if (!sets.length) return "";
+    const count = sets.length;
+    const minReps = Math.min(...sets.map((s) => s.reps));
+    const maxReps = Math.max(...sets.map((s) => s.reps));
+    const repStr  = minReps === maxReps ? `${minReps} reps` : `${minReps}–${maxReps} reps`;
+    const weightSample = sets.find((s) => s.target_weight)?.target_weight;
+    const weightStr    = weightSample ? ` · ${weightSample}` : "";
+    return `${count} set${count !== 1 ? "s" : ""} · ${repStr}${weightStr}`;
+  }
+
+  return (
+    <Modal
+      visible={visible}
+      animationType="slide"
+      onRequestClose={onClose}
+    >
+      <SafeAreaView style={{ flex: 1, backgroundColor: "#06060c" }}>
+        <StatusBar barStyle="light-content" />
+
+        {/* ── Top bar ─────────────────────────────────────────────────────────── */}
+        <View style={{
+          flexDirection: "row",
+          alignItems: "center",
+          paddingHorizontal: 20,
+          paddingTop: 10,
+          paddingBottom: 14,
+        }}>
+          <Pressable
+            onPress={onClose}
+            hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+            style={{
+              width: 36,
+              height: 36,
+              borderRadius: 18,
+              backgroundColor: "#0e0e18",
+              borderWidth: 1,
+              borderColor: "#1e1e2e",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            <Text style={{ color: "#5a5a7a", fontSize: 14, fontWeight: "700", lineHeight: 16 }}>✕</Text>
+          </Pressable>
+
+          <View style={{ flex: 1 }} />
+
+          {/* Progress counter pill */}
+          <View style={{
+            backgroundColor: doneCount > 0 ? ACCENT + "18" : "#0e0e18",
+            borderWidth: 1,
+            borderColor: doneCount > 0 ? ACCENT + "40" : "#1e1e2e",
+            borderRadius: 10,
+            paddingHorizontal: 12,
+            paddingVertical: 6,
+          }}>
+            <Text style={{
+              color: doneCount > 0 ? ACCENT : "#3a3a5a",
+              fontSize: 12,
+              fontWeight: "800",
+              letterSpacing: 0.3,
+            }}>
+              {doneCount}/{totalExercises} complete
+            </Text>
+          </View>
+        </View>
+
+        <ScrollView
+          ref={scrollViewRef}
+          showsVerticalScrollIndicator={false}
+          contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 56 }}
+        >
+
+          {/* ── Workout identity ──────────────────────────────────────────────── */}
+          <View style={{ marginBottom: 28 }}>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 14 }}>
+              <View style={{ backgroundColor: "#0e0c2a", borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3 }}>
+                <Text style={{ color: "#a89fff", fontSize: 10, fontWeight: "800", letterSpacing: 0.8 }}>WORKOUT</Text>
+              </View>
+              <Text style={{ color: "#2e2e48", fontSize: 11, fontWeight: "600" }}>
+                {workout.duration_minutes} min
+              </Text>
+            </View>
+
+            <Text style={{
+              color: "#eeeef5",
+              fontSize: 26,
+              fontWeight: "900",
+              letterSpacing: -0.8,
+              lineHeight: 32,
+              marginBottom: 6,
+            }}>
+              {workout.title}
+            </Text>
+            <Text style={{ color: "#4a4a7a", fontSize: 13, fontWeight: "600" }}>
+              {workout.focus}
+            </Text>
+          </View>
+
+          {/* ── Progress bar ──────────────────────────────────────────────────── */}
+          <View style={{ marginBottom: 32 }}>
+            <View style={{ height: 3, backgroundColor: "#111120", borderRadius: 2, overflow: "hidden", marginBottom: 8 }}>
+              <View style={{
+                height: 3,
+                width: `${progressPct}%` as any,
+                backgroundColor: allDone ? "#66bb6a" : ACCENT,
+                borderRadius: 2,
+              }} />
+            </View>
+            <Text style={{ color: "#3a3a5a", fontSize: 11, fontWeight: "600" }}>
+              {allDone
+                ? `All ${totalExercises} exercises done`
+                : doneCount > 0
+                  ? `${doneCount} of ${totalExercises} complete`
+                  : `${totalExercises} exercises`}
+            </Text>
+          </View>
+
+          {/* ── Exercise cards ────────────────────────────────────────────────── */}
+          <View
+            style={{ gap: 10 }}
+            onLayout={(e) => { listContainerYRef.current = e.nativeEvent.layout.y; }}
+          >
+            {workout.exercises.map((exercise, index) => {
+              const isDone   = completedIds.has(exercise.id);
+              const isActive = exercise.id === activeId;
+              const isNext   = exercise.id === nextId;
+
+              // ── Done: collapsed row ──────────────────────────────────────────
+              if (isDone) {
+                return (
+                  <View
+                    key={exercise.id}
+                    onLayout={(e) => { cardYRef.current[exercise.id] = e.nativeEvent.layout.y; }}
+                    style={{
+                      backgroundColor: "#080808",
+                      borderWidth: 1,
+                      borderColor: "#0e0e0e",
+                      borderRadius: 14,
+                      flexDirection: "row",
+                      alignItems: "center",
+                      paddingHorizontal: 16,
+                      paddingVertical: 14,
+                      gap: 12,
+                    }}
+                  >
+                    <View style={{
+                      width: 26,
+                      height: 26,
+                      borderRadius: 13,
+                      backgroundColor: "#66bb6a18",
+                      borderWidth: 1,
+                      borderColor: "#66bb6a30",
+                      alignItems: "center",
+                      justifyContent: "center",
+                    }}>
+                      <Text style={{ color: "#66bb6a", fontSize: 11, fontWeight: "900" }}>✓</Text>
+                    </View>
+                    <Text style={{
+                      flex: 1,
+                      color: "#2e2e2e",
+                      fontSize: 14,
+                      fontWeight: "700",
+                      textDecorationLine: "line-through",
+                    }}>
+                      {exercise.name}
+                    </Text>
+                    <Text style={{ color: "#1e2e1e", fontSize: 11, fontWeight: "700" }}>DONE</Text>
+                  </View>
+                );
+              }
+
+              // ── Active: full detail card ─────────────────────────────────────
+              if (isActive) {
+                return (
+                  <View
+                    key={exercise.id}
+                    onLayout={(e) => { cardYRef.current[exercise.id] = e.nativeEvent.layout.y; }}
+                    style={{
+                      backgroundColor: "#0d0b22",
+                      borderWidth: 1,
+                      borderColor: "#3d35a0",
+                      borderRadius: 16,
+                      overflow: "hidden",
+                    }}
+                  >
+                    {/* ACCENT top strip — signals "you are here" */}
+                    <View style={{ height: 3, backgroundColor: ACCENT }} />
+
+                    <View style={{ padding: 20, gap: 18 }}>
+
+                      {/* Header: NOW badge + name */}
+                      <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 12 }}>
+                        <View style={{ flex: 1, gap: 6 }}>
+                          <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                            <View style={{
+                              backgroundColor: ACCENT + "28",
+                              borderRadius: 4,
+                              paddingHorizontal: 6,
+                              paddingVertical: 2,
+                            }}>
+                              <Text style={{ color: ACCENT, fontSize: 9, fontWeight: "900", letterSpacing: 1.2 }}>NOW</Text>
+                            </View>
+                            <Text style={{ color: ACCENT + "70", fontSize: 10, fontWeight: "700", letterSpacing: 0.6 }}>
+                              {index + 1} of {workout.exercises.length}
+                            </Text>
+                          </View>
+                          <Text style={{
+                            color: "#ffffff",
+                            fontSize: 21,
+                            fontWeight: "900",
+                            letterSpacing: -0.5,
+                            lineHeight: 27,
+                          }}>
+                            {exercise.name}
+                          </Text>
+                        </View>
+                      </View>
+
+                      {/* Sets table */}
+                      <View>
+                        <View style={{
+                          flexDirection: "row",
+                          paddingBottom: 10,
+                          borderBottomWidth: 1,
+                          borderBottomColor: "#1e1c3a",
+                          marginBottom: 2,
+                        }}>
+                          <Text style={{ color: "#4a4a7a", fontSize: 10, fontWeight: "800", letterSpacing: 1, width: 44 }}>SET</Text>
+                          <Text style={{ color: "#4a4a7a", fontSize: 10, fontWeight: "800", letterSpacing: 1, width: 64 }}>REPS</Text>
+                          <Text style={{ color: "#4a4a7a", fontSize: 10, fontWeight: "800", letterSpacing: 1, flex: 1 }}>WEIGHT</Text>
+                        </View>
+                        {exercise.sets.map((set) => (
+                          <View key={set.set_number} style={{ flexDirection: "row", paddingVertical: 9 }}>
+                            <Text style={{ color: "#5a5a9a", fontSize: 15, fontWeight: "700", width: 44 }}>
+                              {set.set_number}
+                            </Text>
+                            <Text style={{ color: "#d0d0f0", fontSize: 17, fontWeight: "700", width: 64 }}>
+                              {set.reps}
+                            </Text>
+                            <Text style={{ color: set.target_weight ? "#d0d0f0" : "#3a3a5a", fontSize: 17, fontWeight: "700", flex: 1 }}>
+                              {set.target_weight ?? "—"}
+                            </Text>
+                          </View>
+                        ))}
+                      </View>
+
+                      {/* Coaching cue */}
+                      {exercise.cue ? (
+                        <View style={{
+                          backgroundColor: "#09090e",
+                          borderRadius: 10,
+                          borderLeftWidth: 2,
+                          borderLeftColor: ACCENT + "70",
+                          paddingHorizontal: 14,
+                          paddingVertical: 12,
+                        }}>
+                          <Text style={{ color: "#7070b0", fontSize: 13, lineHeight: 21, fontStyle: "italic" }}>
+                            {exercise.cue}
+                          </Text>
+                        </View>
+                      ) : null}
+
+                      {/* Rest time */}
+                      {exercise.rest_seconds > 0 ? (
+                        <Text style={{ color: "#3a3a60", fontSize: 12, fontWeight: "600" }}>
+                          Rest between sets — {formatRest(exercise.rest_seconds)}
+                        </Text>
+                      ) : null}
+
+                      {/* Primary action */}
+                      <Pressable
+                        onPress={() => markDone(exercise.id)}
+                        style={{
+                          backgroundColor: ACCENT,
+                          borderRadius: 14,
+                          paddingVertical: 17,
+                          alignItems: "center",
+                          marginTop: 2,
+                        }}
+                      >
+                        <Text style={{ color: "#fff", fontSize: 15, fontWeight: "900", letterSpacing: 0.3 }}>
+                          {isLastExercise ? "Finish workout →" : "Done — next exercise →"}
+                        </Text>
+                      </Pressable>
+
+                    </View>
+                  </View>
+                );
+              }
+
+              // ── Upcoming: compact summary row ────────────────────────────────
+              return (
+                <View
+                  key={exercise.id}
+                  onLayout={(e) => { cardYRef.current[exercise.id] = e.nativeEvent.layout.y; }}
+                  style={{
+                    backgroundColor: isNext ? "#0a0918" : "#080810",
+                    borderWidth: 1,
+                    borderColor: isNext ? "#1e1c38" : "#111118",
+                    borderRadius: 14,
+                    flexDirection: "row",
+                    alignItems: "center",
+                    paddingHorizontal: 16,
+                    paddingVertical: 14,
+                    gap: 12,
+                  }}
+                >
+                  <View style={{
+                    width: 26,
+                    height: 26,
+                    borderRadius: 13,
+                    backgroundColor: isNext ? "#14122a" : "#0e0e18",
+                    borderWidth: 1,
+                    borderColor: isNext ? "#2a2848" : "#1a1a28",
+                    alignItems: "center",
+                    justifyContent: "center",
+                  }}>
+                    <Text style={{ color: isNext ? "#5a58a0" : "#2e2e48", fontSize: 11, fontWeight: "800" }}>{index + 1}</Text>
+                  </View>
+                  <View style={{ flex: 1, gap: 3 }}>
+                    <Text style={{ color: isNext ? "#6060a0" : "#404060", fontSize: 14, fontWeight: "700" }}>{exercise.name}</Text>
+                    <Text style={{ color: isNext ? "#2e2e50" : "#252535", fontSize: 11, fontWeight: "600" }}>{summarizeSets(exercise.sets)}</Text>
+                  </View>
+                  {isNext && (
+                    <View style={{
+                      backgroundColor: "#1a1830",
+                      borderRadius: 4,
+                      paddingHorizontal: 6,
+                      paddingVertical: 3,
+                    }}>
+                      <Text style={{ color: "#4a4880", fontSize: 9, fontWeight: "900", letterSpacing: 1 }}>NEXT</Text>
+                    </View>
+                  )}
+                </View>
+              );
+            })}
+          </View>
+
+          {/* ── Completion section ────────────────────────────────────────────── */}
+          {allDone && (
+            <View style={{ marginTop: 28, gap: 12 }}>
+              {/* Summary banner */}
+              <View style={{
+                backgroundColor: "#66bb6a0e",
+                borderWidth: 1,
+                borderColor: "#66bb6a28",
+                borderRadius: 16,
+                padding: 20,
+                alignItems: "center",
+                gap: 6,
+              }}>
+                <Text style={{ color: "#66bb6a", fontSize: 22, fontWeight: "900", letterSpacing: -0.5 }}>
+                  Workout done
+                </Text>
+                <Text style={{ color: "#66bb6a50", fontSize: 13, fontWeight: "500" }}>
+                  {totalExercises} exercise{totalExercises !== 1 ? "s" : ""} · {workout.duration_minutes} min
+                </Text>
+                {/* Confirm task was auto-completed */}
+                {taskDone && (
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 5, marginTop: 4 }}>
+                    <Text style={{ color: "#66bb6a60", fontSize: 11, fontWeight: "700" }}>✓</Text>
+                    <Text style={{ color: "#66bb6a60", fontSize: 11, fontWeight: "600" }}>Logged in today's plan</Text>
+                  </View>
+                )}
+              </View>
+
+              {/* Single dismiss — task was already auto-completed by the effect */}
+              <Pressable
+                onPress={onClose}
+                style={{
+                  backgroundColor: taskDone ? "#66bb6a" : "#0e0e18",
+                  borderWidth: 1,
+                  borderColor: taskDone ? "#66bb6a" : "#1e1e2e",
+                  borderRadius: 14,
+                  paddingVertical: 16,
+                  alignItems: "center",
+                }}
+              >
+                <Text style={{
+                  color: taskDone ? "#fff" : "#4a4a6a",
+                  fontSize: 15,
+                  fontWeight: "800",
+                }}>
+                  Back to today
+                </Text>
+              </Pressable>
+            </View>
+          )}
+
+        </ScrollView>
+      </SafeAreaView>
+    </Modal>
+  );
+}
+
+// ---------- Task detail content ----------
+// Per-kind instructions, success criteria, and why-it-matters copy shown in
+// the Task Detail screen. Add new kinds here — no other files need to change.
+type TaskDetailContent = {
+  instructions:    string[];
+  successCriteria: string[];
+  whyItMatters:    string;
+};
+
+const TASK_CONTENT: Partial<Record<TaskKind, TaskDetailContent>> = {
+  Workout: {
+    instructions: [
+      "Warm up 3–5 min — light cardio or dynamic stretching",
+      "Lead with your heaviest compound lift while you're fresh",
+      "Move through accessory work at controlled tempo",
+      "Finish with a 2–3 min cooldown stretch — don't skip it",
+    ],
+    successCriteria: [
+      "All working sets completed",
+      "Weight and reps logged",
+      "Cooldown done",
+    ],
+    whyItMatters:
+      "Every session is compounding interest on your physique and discipline. Skip once, break the chain.",
+  },
+  Nutrition: {
+    instructions: [
+      "Prep before you're hungry — decision fatigue kills good eating",
+      "Anchor the meal around a protein source: chicken, fish, eggs, or Greek yogurt",
+      "Fill the rest of the plate with vegetables and a complex carb",
+      "Eat slowly — 20 minutes for your brain to register fullness",
+    ],
+    successCriteria: [
+      "Protein target hit for this meal",
+      "No junk substitutions",
+      "Meal eaten — not skipped",
+    ],
+    whyItMatters:
+      "Nutrition drives 70% of body composition. The workout earns the right to eat well — don't waste it.",
+  },
+  Hydration: {
+    instructions: [
+      "Fill a large bottle before you start",
+      "Drink 500ml before your first meal",
+      "Sip steadily through the day — don't chug all at once",
+      "Add a pinch of salt if you're sweating heavily or training hard",
+    ],
+    successCriteria: [
+      "Daily water target hit (2–3L minimum)",
+      "Urine is pale yellow — not dark",
+    ],
+    whyItMatters:
+      "Even mild dehydration tanks focus, energy, and strength output. Water is the cheapest performance tool available.",
+  },
+  Mobility: {
+    instructions: [
+      "Hip flexor stretch — 60 seconds each side",
+      "Thoracic rotation — 10 slow reps each side",
+      "Doorframe chest stretch — 30 seconds",
+      "Hamstring stretch — 30 seconds each side",
+    ],
+    successCriteria: [
+      "10+ minutes completed",
+      "Major muscle groups addressed",
+      "Full range of motion — no rushing",
+    ],
+    whyItMatters:
+      "Daily mobility compounds over months. Five minutes now prevents years of stiffness and avoids injuries that kill your progress.",
+  },
+  Recovery: {
+    instructions: [
+      "5 slow diaphragmatic breaths to settle your nervous system",
+      "Foam roll the main muscle groups worked today — 30–60 sec per area",
+      "Light static stretching on your tightest areas",
+      "End with 2–3 min of stillness — no phone",
+    ],
+    successCriteria: [
+      "20+ minutes completed",
+      "Worked muscle groups addressed",
+      "Calmer at the end than at the start",
+    ],
+    whyItMatters:
+      "Adaptation happens during recovery, not during training. Skipping this is stealing from tomorrow's performance.",
+  },
+  Habit: {
+    instructions: [
+      "Identify the exact trigger that starts this habit",
+      "Execute immediately — no negotiation, no delay",
+      "Stack it onto an existing routine to reduce friction",
+      "Mark it done as soon as it's complete",
+    ],
+    successCriteria: [
+      "Habit completed — not modified or abbreviated",
+      "Logged and marked done",
+    ],
+    whyItMatters:
+      "Habits are the architecture of identity. Every rep of this makes the behaviour more automatic and effortless.",
+  },
+  Sleep: {
+    instructions: [
+      "Begin wind-down 30–45 min before your target sleep time",
+      "Screens off — phone on charger, out of reach",
+      "Dim lights; lower room temperature if possible",
+      "Set your alarm once and don't touch it again",
+    ],
+    successCriteria: [
+      "In bed by target time",
+      "7–9 hours of sleep",
+      "No phone after wind-down starts",
+    ],
+    whyItMatters:
+      "Sleep is when your body rebuilds and your brain consolidates everything learned. There is no high performance without consistent, quality sleep.",
+  },
+  Walk: {
+    instructions: [
+      "Get outside — fresh air multiplies the benefit",
+      "Pace should feel brisk — slightly elevated heart rate",
+      "Phone in pocket or listening to something useful",
+      "Aim for 20+ minutes of continuous movement",
+    ],
+    successCriteria: [
+      "20+ minutes completed",
+      "Continuous movement throughout",
+    ],
+    whyItMatters:
+      "Daily walking improves mood, lowers cortisol, and adds low-intensity activity that compounds over weeks into real results.",
+  },
+  Meal: {
+    instructions: [
+      "Prep before you're hungry",
+      "Protein first — anchor the plate around it",
+      "Eat without screens for at least this meal",
+      "Track or note calories if you're in a specific phase",
+    ],
+    successCriteria: [
+      "Meal eaten — not skipped",
+      "Protein-first composition",
+    ],
+    whyItMatters:
+      "Consistent meals regulate energy, reduce cravings, and directly support your body composition goal.",
+  },
+};
+
+// ---------- Task Detail Modal ----------
+function TaskDetailModal({
+  task,
+  visible,
+  onClose,
+  onToggle,
+}: {
+  task:     TimedTask | null;
+  visible:  boolean;
+  onClose:  () => void;
+  onToggle: (id: string) => void;
+}) {
+  if (!task) return null;
+
+  const content    = TASK_CONTENT[task.kind];
+  const kindStyle  = KIND_COLORS[task.kind];
+  const kindColor  = kindStyle?.color      ?? "#888";
+  const kindBg     = kindStyle?.backgroundColor ?? "#111";
+  const duration   = KIND_DURATION[task.kind];
+  const priority   = task.priority ?? "medium";
+  const priorityColor =
+    priority === "high"   ? "#FF5252" :
+    priority === "medium" ? "#FFB300" : "#555";
+  const priorityLabel =
+    priority === "high"   ? "REQUIRED" :
+    priority === "medium" ? "OPTIONAL" : "OPTIONAL";
+
+  return (
+    <Modal
+      visible={visible}
+      transparent
+      animationType="slide"
+      onRequestClose={onClose}
+    >
+      <Pressable
+        style={{ flex: 1, backgroundColor: "rgba(0,0,0,0.6)", justifyContent: "flex-end" }}
+        onPress={onClose}
+      >
+        <Pressable onPress={() => {}} style={{ maxHeight: "92%" }}>
+          <View style={{ backgroundColor: "#0a0a0f", borderTopLeftRadius: 24, borderTopRightRadius: 24, overflow: "hidden" }}>
+
+            {/* Drag handle */}
+            <View style={{ alignItems: "center", paddingTop: 12, paddingBottom: 4 }}>
+              <View style={{ width: 36, height: 4, borderRadius: 2, backgroundColor: "#252535" }} />
+            </View>
+
+            <ScrollView
+              showsVerticalScrollIndicator={false}
+              contentContainerStyle={{ paddingHorizontal: 24, paddingBottom: 40, gap: 0 }}
+            >
+              {/* ── Kind + priority header ─────────────────────────────────────── */}
+              <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingTop: 16, paddingBottom: 20 }}>
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                  <View style={{ backgroundColor: kindBg, borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3 }}>
+                    <Text style={{ color: kindColor, fontSize: 10, fontWeight: "800", letterSpacing: 0.8 }}>
+                      {task.kind.toUpperCase()}
+                    </Text>
+                  </View>
+                  {duration && (
+                    <Text style={{ color: "#2e2e48", fontSize: 11, fontWeight: "600" }}>{duration}</Text>
+                  )}
+                </View>
+                <View style={{ backgroundColor: priorityColor + "18", borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3 }}>
+                  <Text style={{ color: priorityColor, fontSize: 10, fontWeight: "800", letterSpacing: 0.8 }}>
+                    {priorityLabel}
+                  </Text>
+                </View>
+              </View>
+
+              {/* ── Time + title ───────────────────────────────────────────────── */}
+              <Text style={{ color: "#3a3a5a", fontSize: 12, fontWeight: "700", letterSpacing: 0.3, marginBottom: 8 }}>
+                {task.timeText}
+              </Text>
+              <Text style={{
+                color: task.done ? "#555" : "#eeeef5",
+                fontSize: 22,
+                fontWeight: "800",
+                lineHeight: 30,
+                letterSpacing: -0.5,
+                textDecorationLine: task.done ? "line-through" : "none",
+                marginBottom: 28,
+              }}>
+                {task.title}
+              </Text>
+
+              {content ? (
+                <>
+                  {/* Thin divider */}
+                  <View style={{ height: 1, backgroundColor: "#111120", marginBottom: 28 }} />
+
+                  {/* ── Instructions ───────────────────────────────────────────── */}
+                  <View style={{ marginBottom: 28 }}>
+                    <Text style={{ color: "#3a3a5a", fontSize: 10, fontWeight: "800", letterSpacing: 1.2, marginBottom: 14 }}>
+                      HOW TO DO IT
+                    </Text>
+                    <View style={{ gap: 12 }}>
+                      {content.instructions.map((step, i) => (
+                        <View key={i} style={{ flexDirection: "row", gap: 12 }}>
+                          <Text style={{ color: kindColor + "80", fontSize: 12, fontWeight: "800", width: 16, paddingTop: 1 }}>
+                            {i + 1}
+                          </Text>
+                          <Text style={{ flex: 1, color: "#8888a8", fontSize: 14, lineHeight: 22, fontWeight: "500" }}>
+                            {step}
+                          </Text>
+                        </View>
+                      ))}
+                    </View>
+                  </View>
+
+                  {/* ── Success criteria ───────────────────────────────────────── */}
+                  <View style={{ marginBottom: 28 }}>
+                    <Text style={{ color: "#3a3a5a", fontSize: 10, fontWeight: "800", letterSpacing: 1.2, marginBottom: 14 }}>
+                      DONE WHEN
+                    </Text>
+                    <View style={{ gap: 10 }}>
+                      {content.successCriteria.map((criterion, i) => (
+                        <View key={i} style={{ flexDirection: "row", gap: 10, alignItems: "flex-start" }}>
+                          <Text style={{ color: "#66bb6a", fontSize: 12, fontWeight: "900", paddingTop: 2 }}>✓</Text>
+                          <Text style={{ flex: 1, color: "#7070a0", fontSize: 14, lineHeight: 22, fontWeight: "500" }}>
+                            {criterion}
+                          </Text>
+                        </View>
+                      ))}
+                    </View>
+                  </View>
+
+                  {/* ── Why it matters ─────────────────────────────────────────── */}
+                  <View style={{
+                    backgroundColor: "#08080f",
+                    borderWidth: 1,
+                    borderColor: "#111120",
+                    borderRadius: 12,
+                    padding: 16,
+                    marginBottom: 32,
+                  }}>
+                    <Text style={{ color: "#2e2e48", fontSize: 10, fontWeight: "800", letterSpacing: 1.2, marginBottom: 8 }}>
+                      WHY IT MATTERS
+                    </Text>
+                    <Text style={{ color: "#6060a0", fontSize: 13, lineHeight: 21, fontStyle: "italic" }}>
+                      {content.whyItMatters}
+                    </Text>
+                  </View>
+                </>
+              ) : (
+                <View style={{ height: 24 }} />
+              )}
+
+              {/* ── Completion button ──────────────────────────────────────────── */}
+              <Pressable
+                onPress={() => { onToggle(task.id); onClose(); }}
+                style={{
+                  backgroundColor: task.done ? "#0e0e0e" : "#66bb6a",
+                  borderWidth: 1,
+                  borderColor: task.done ? "#1e1e1e" : "#66bb6a",
+                  borderRadius: 14,
+                  paddingVertical: 16,
+                  alignItems: "center",
+                }}
+              >
+                <Text style={{
+                  color: task.done ? "#444" : "#fff",
+                  fontSize: 15,
+                  fontWeight: "800",
+                  letterSpacing: 0.2,
+                }}>
+                  {task.done ? "Mark incomplete" : "Mark complete"}
+                </Text>
+              </Pressable>
+            </ScrollView>
+          </View>
+        </Pressable>
+      </Pressable>
+    </Modal>
+  );
+}
+
 function TaskRow({
   task,
   onToggle,
-  onHowTo,
+  onDetail,
 }: {
-  task: TimedTask;
+  task:     TimedTask;
   onToggle: () => void;
-  onHowTo?: () => void;
+  onDetail: () => void;
 }) {
-  const priority   = task.priority ?? "medium";
-  const accentBar  = PRIORITY_LEFT_COLOR[priority] ?? "#2a2a2a";
-  const kindStyle  = KIND_COLORS[task.kind];
+  const priority  = task.priority ?? "medium";
+  const accentBar = PRIORITY_LEFT_COLOR[priority] ?? "#2a2a2a";
 
   return (
     <Pressable
-      onPress={onToggle}
+      onPress={onDetail}
       style={{
         backgroundColor: task.done ? "#0a0a0a" : "#0f0f0f",
         borderWidth: 1,
@@ -956,14 +1792,14 @@ function TaskRow({
       <View style={{ width: 3, backgroundColor: task.done ? "#1e1e1e" : accentBar }} />
 
       {/* Content */}
-      <View style={{ flex: 1, padding: 14, gap: 6 }}>
-        {/* Time + Duration row */}
-        <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-          <Text style={{ color: task.done ? "#2e2e2e" : "#5a5a7a", fontSize: 11, fontWeight: "700", letterSpacing: 0.4 }}>
+      <View style={{ flex: 1, paddingVertical: 14, paddingLeft: 14, paddingRight: 4, gap: 7 }}>
+        {/* Meta row: time · duration */}
+        <View style={{ flexDirection: "row", alignItems: "center" }}>
+          <Text style={{ color: task.done ? "#2a2a2a" : "#5a5a7a", fontSize: 11, fontWeight: "700", letterSpacing: 0.4 }}>
             {task.timeText}
           </Text>
           {KIND_DURATION[task.kind] && (
-            <Text style={{ color: task.done ? "#252525" : "#383848", fontSize: 11, fontWeight: "500" }}>
+            <Text style={{ color: task.done ? "#222" : "#2e2e48", fontSize: 11, fontWeight: "500", marginLeft: 5 }}>
               · {KIND_DURATION[task.kind]}
             </Text>
           )}
@@ -972,43 +1808,23 @@ function TaskRow({
         {/* Title */}
         <Text
           style={{
-            color: task.done ? "#3a3a3a" : "#ededf0",
-            fontSize: 14,
+            color: task.done ? "#373737" : "#ececef",
+            fontSize: 15,
             fontWeight: "700",
-            lineHeight: 20,
+            lineHeight: 21,
             textDecorationLine: task.done ? "line-through" : "none",
           }}
         >
           {task.title}
         </Text>
-
-        {/* Kind pill row */}
-        <View style={{ flexDirection: "row", alignItems: "center", gap: 8, marginTop: 1 }}>
-          <View style={{
-            backgroundColor: task.done ? "#111" : (kindStyle?.backgroundColor ?? "#111"),
-            borderWidth: 1,
-            borderColor: task.done ? "#1c1c1c" : (kindStyle?.borderColor ?? "#333"),
-            borderRadius: 6,
-            paddingHorizontal: 7,
-            paddingVertical: 2,
-          }}>
-            <Text style={{ color: task.done ? "#2e2e2e" : (kindStyle?.color ?? "#666"), fontSize: 10, fontWeight: "800" }}>
-              {task.kind}
-            </Text>
-          </View>
-          {onHowTo && !task.done && (
-            <Pressable
-              onPress={(e) => { e.stopPropagation?.(); onHowTo(); }}
-              hitSlop={8}
-            >
-              <Text style={{ color: ACCENT + "cc", fontSize: 10, fontWeight: "800", letterSpacing: 0.4 }}>HOW TO</Text>
-            </Pressable>
-          )}
-        </View>
       </View>
 
-      {/* Completion toggle */}
-      <View style={{ justifyContent: "center", paddingRight: 16, paddingLeft: 4 }}>
+      {/* Completion toggle — separate pressable so it doesn't open detail */}
+      <Pressable
+        onPress={(e) => { e.stopPropagation?.(); onToggle(); }}
+        hitSlop={{ top: 12, bottom: 12, left: 12, right: 0 }}
+        style={{ justifyContent: "center", paddingRight: 16, paddingLeft: 4 }}
+      >
         <View style={{
           width: 22,
           height: 22,
@@ -1023,7 +1839,7 @@ function TaskRow({
             <Text style={{ color: "#66bb6a", fontSize: 12, fontWeight: "900", lineHeight: 14 }}>✓</Text>
           )}
         </View>
-      </View>
+      </Pressable>
     </Pressable>
   );
 }
@@ -1388,7 +2204,8 @@ export default function Index() {
   // persistence — false until the initial AsyncStorage load completes
   const [loaded, setLoaded] = useState(false);
   const [showMotivation, setShowMotivation] = useState(false);
-  const [demoTask, setDemoTask] = useState<TimedTask | null>(null);
+  const [detailTask,  setDetailTask]  = useState<TimedTask | null>(null);
+  const [workoutTask, setWorkoutTask] = useState<TimedTask | null>(null);
 
   // profile/auth
   const [authed, setAuthed] = useState(false);
@@ -1474,6 +2291,13 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
       ? streak.currentStreak
       : 0;
   }, [streak]);
+
+  // Core task toggle — used by both Today's inline toggle and TaskDetailModal.
+  // Streak, feedback, and backend sync are handled separately inside Today's
+  // toggleTask closure; this function owns only the state mutation.
+  const toggleTaskById = (id: string) => {
+    setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, done: !t.done } : t)));
+  };
 
   // Onboarding fields
   const [name, setName] = useState("");
@@ -2303,8 +3127,14 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
       }
     };
 
-    const doneCount  = rebalancedTasks.filter((t) => t.done).length;
-    const totalCount = rebalancedTasks.length;
+    // Mock fallback — only active in dev builds when no real data is present.
+    const isMockActive   = __DEV__ && DEV_MOCK_ENABLED && !aiPlanLoading && !aiPlanError && aiPlan === null && tasks.length === 0;
+    const effectivePlan  = isMockActive ? DEV_MOCK_PLAN  : aiPlan;
+    const effectiveTasks = isMockActive ? DEV_MOCK_TASKS : rebalancedTasks;
+    const effectiveScore = isMockActive ? calcScore(DEV_MOCK_TASKS) : score;
+
+    const doneCount  = effectiveTasks.filter((t) => t.done).length;
+    const totalCount = effectiveTasks.length;
     const allDone    = totalCount > 0 && doneCount === totalCount;
     const dateStr    = new Date().toLocaleDateString("en-US", {
       weekday: "long", month: "long", day: "numeric",
@@ -2341,7 +3171,75 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
               {getGreeting()}, {profile.name}.
             </Text>
           ) : null}
+          {isMockActive && (
+            <View style={{ marginTop: 10, backgroundColor: "#1a1000", borderWidth: 1, borderColor: "#3a2800", borderRadius: 6, paddingHorizontal: 8, paddingVertical: 4, alignSelf: "flex-start" }}>
+              <Text style={{ color: "#8a6400", fontSize: 10, fontWeight: "800", letterSpacing: 0.8 }}>DEV · MOCK DATA</Text>
+            </View>
+          )}
         </View>
+
+        {/* ── Score anchor ────────────────────────────────────────────────────── */}
+        {totalCount > 0 && (
+          <View style={{
+            backgroundColor: "#09090f",
+            borderWidth: 1,
+            borderColor: "#18182a",
+            borderRadius: 16,
+            padding: 20,
+            marginBottom: 16,
+          }}>
+            <View style={{ flexDirection: "row", alignItems: "flex-end", justifyContent: "space-between" }}>
+              {/* Score */}
+              <View style={{ gap: 5 }}>
+                <Text style={{
+                  color: effectiveScore >= 80 ? "#66bb6a" : "#fff",
+                  fontSize: 52,
+                  fontWeight: "900",
+                  letterSpacing: -2,
+                  lineHeight: 52,
+                }}>
+                  {effectiveScore}
+                </Text>
+                <Text style={{ color: "#2e2e48", fontSize: 10, fontWeight: "800", letterSpacing: 1.2 }}>
+                  DISCIPLINE SCORE
+                </Text>
+              </View>
+
+              {/* Streak */}
+              <View style={{ alignItems: "flex-end", gap: 5 }}>
+                <Text style={{
+                  color: liveStreak > 0 ? ACCENT : "#252535",
+                  fontSize: 32,
+                  fontWeight: "900",
+                  letterSpacing: -1,
+                  lineHeight: 32,
+                }}>
+                  {liveStreak}
+                </Text>
+                <Text style={{ color: "#2e2e48", fontSize: 10, fontWeight: "800", letterSpacing: 1.2 }}>
+                  {liveStreak === 1 ? "DAY STREAK" : "DAY STREAK"}
+                </Text>
+              </View>
+            </View>
+
+            {/* Progress bar */}
+            <View style={{ marginTop: 20, gap: 7 }}>
+              <View style={{ height: 2, backgroundColor: "#14142a", borderRadius: 1, overflow: "hidden" }}>
+                <View style={{
+                  height: 2,
+                  width: `${Math.round((doneCount / totalCount) * 100)}%` as any,
+                  backgroundColor: allDone ? "#66bb6a" : ACCENT,
+                  borderRadius: 1,
+                }} />
+              </View>
+              <Text style={{ color: "#2a2a42", fontSize: 11, fontWeight: "600" }}>
+                {allDone
+                  ? "All tasks complete"
+                  : `${doneCount} of ${totalCount} complete`}
+              </Text>
+            </View>
+          </View>
+        )}
 
         {/* ── Game Plan strip ─────────────────────────────────────────────────── */}
         {gamePlan ? (
@@ -2376,7 +3274,7 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
                 {gamePlan.message}
               </Text>
             </View>
-            <Text style={{ color: "#2a2a2a", fontSize: 20 }}>›</Text>
+            <Text style={{ color: "#333", fontSize: 20 }}>›</Text>
           </Pressable>
         ) : (
           <Pressable
@@ -2421,7 +3319,7 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
         )}
 
         {/* ── Plan exists ─────────────────────────────────────────────────────── */}
-        {aiPlan && !aiPlanError && (
+        {effectivePlan && !aiPlanError && (
           <>
             {/* Day focus summary */}
             <View style={{
@@ -2434,7 +3332,7 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
               gap: 6,
             }}>
               <Text style={{ color: "#4a4a7a", fontSize: 10, fontWeight: "800", letterSpacing: 1 }}>TODAY'S FOCUS</Text>
-              <Text style={{ color: "#b0b0c0", fontSize: 14, lineHeight: 22, fontWeight: "500" }}>{aiPlan.summary}</Text>
+              <Text style={{ color: "#b0b0c0", fontSize: 14, lineHeight: 22, fontWeight: "500" }}>{effectivePlan.summary}</Text>
             </View>
           </>
         )}
@@ -2443,34 +3341,29 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
         {totalCount > 0 ? (
           <View style={{ gap: 8, marginBottom: 28 }}>
             {/* Section header */}
-            <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-              <Text style={{ color: allDone ? "#66bb6a" : "#fff", fontSize: 13, fontWeight: "800", letterSpacing: 0.2 }}>
-                {allDone ? "All done  ✓" : "Tasks"}
+            <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+              <Text style={{ color: "#2e2e48", fontSize: 10, fontWeight: "800", letterSpacing: 1 }}>
+                TODAY'S TASKS
               </Text>
-              <Text style={{
-                color: allDone ? "#66bb6a" : doneCount > 0 ? "#666" : "#333",
-                fontSize: 12,
-                fontWeight: "700",
-              }}>
-                {doneCount}/{totalCount}
-              </Text>
+              {pausedCount > 0 && (
+                <Text style={{ color: "#252535", fontSize: 10, fontWeight: "600" }}>
+                  {pausedCount} paused · {gamePlan?.timeMode}
+                </Text>
+              )}
             </View>
 
-            {rebalancedTasks.map((task) => (
+            {effectiveTasks.map((task) => (
               <TaskRow
                 key={task.id}
                 task={task}
                 onToggle={() => toggleTask(task.id)}
-                onHowTo={WORKOUT_KINDS[task.kind] ? () => setDemoTask(task) : undefined}
+                onDetail={() => {
+                  if (task.kind === "Workout") setWorkoutTask(task);
+                  else setDetailTask(task);
+                }}
               />
             ))}
 
-            {/* Paused note */}
-            {pausedCount > 0 && (
-              <Text style={{ color: "#2a2a2a", fontSize: 11, textAlign: "center", marginTop: 4 }}>
-                {pausedCount} task{pausedCount !== 1 ? "s" : ""} paused · {gamePlan?.timeMode} mode
-              </Text>
-            )}
           </View>
         ) : (
           /* ── Empty state ──────────────────────────────────────────────────── */
@@ -2528,7 +3421,7 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
         )}
 
         {/* ── Coaching note + fallback ────────────────────────────────────────── */}
-        {aiPlan && (
+        {effectivePlan && (
           <View style={{ gap: 10, marginTop: 8 }}>
             {/* Coaching note card */}
             <View style={{
@@ -2540,7 +3433,7 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
               gap: 6,
             }}>
               <Text style={{ color: "#4a4a7a", fontSize: 10, fontWeight: "800", letterSpacing: 1 }}>COACHING NOTE</Text>
-              <Text style={{ color: "#9090a8", fontSize: 13, lineHeight: 20, fontWeight: "500" }}>{aiPlan.coachingNote}</Text>
+              <Text style={{ color: "#9090a8", fontSize: 13, lineHeight: 20, fontWeight: "500" }}>{effectivePlan.coachingNote}</Text>
             </View>
 
             {/* Fallback card */}
@@ -2553,22 +3446,19 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
               gap: 6,
             }}>
               <Text style={{ color: "#3a3a5a", fontSize: 10, fontWeight: "800", letterSpacing: 1 }}>IF THE DAY FALLS APART</Text>
-              <Text style={{ color: "#585870", fontSize: 13, lineHeight: 20, fontStyle: "italic" }}>{aiPlan.fallbackPlan}</Text>
+              <Text style={{ color: "#585870", fontSize: 13, lineHeight: 20, fontStyle: "italic" }}>{effectivePlan.fallbackPlan}</Text>
             </View>
 
-            <Pressable onPress={generateAIPlan} style={{ alignSelf: "flex-start", paddingVertical: 4 }}>
-              <Text style={{ color: "#333", fontSize: 12, fontWeight: "700" }}>Regenerate plan →</Text>
-            </Pressable>
           </View>
         )}
 
         {/* ── Generate prompt — no plan yet but game plan exists ─────────────── */}
-        {!aiPlan && !aiPlanError && totalCount === 0 && gamePlan && (
+        {!effectivePlan && !aiPlanError && totalCount === 0 && gamePlan && (
           <View style={{ marginTop: 8 }} />
         )}
 
         {/* ── No AI plan but has local tasks — show generate nudge ────────────── */}
-        {!aiPlan && !aiPlanError && totalCount > 0 && (
+        {!effectivePlan && !aiPlanError && totalCount > 0 && (
           <Pressable
             onPress={generateAIPlan}
             style={{
@@ -2587,31 +3477,11 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
           </Pressable>
         )}
 
-        {/* ── Score + streak footer ───────────────────────────────────────────── */}
-        {totalCount > 0 && (
-          <View style={{
-            flexDirection: "row",
-            justifyContent: "center",
-            gap: 0,
-            marginTop: 24,
-            paddingTop: 20,
-            borderTopWidth: 1,
-            borderTopColor: "#111",
-          }}>
-            <View style={{ flex: 1, alignItems: "center", gap: 4 }}>
-              <Text style={{ color: "#fff", fontSize: 22, fontWeight: "800" }}>{score}</Text>
-              <Text style={{ color: "#444", fontSize: 10, fontWeight: "700", letterSpacing: 0.8 }}>SCORE</Text>
-            </View>
-            <View style={{ width: 1, backgroundColor: "#181818" }} />
-            <View style={{ flex: 1, alignItems: "center", gap: 4 }}>
-              <Text style={{ color: liveStreak > 0 ? ACCENT : "#333", fontSize: 22, fontWeight: "800" }}>
-                {liveStreak}
-              </Text>
-              <Text style={{ color: "#444", fontSize: 10, fontWeight: "700", letterSpacing: 0.8 }}>
-                {liveStreak === 1 ? "DAY" : "DAYS"}
-              </Text>
-            </View>
-          </View>
+        {/* ── Regenerate nudge when plan exists ─────────────────────────────── */}
+        {effectivePlan && !isMockActive && totalCount > 0 && (
+          <Pressable onPress={generateAIPlan} style={{ alignSelf: "flex-start", paddingVertical: 4, marginTop: 4 }}>
+            <Text style={{ color: "#252535", fontSize: 12, fontWeight: "700" }}>Regenerate plan →</Text>
+          </Pressable>
         )}
       </ScrollView>
     );
@@ -3389,65 +4259,26 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
         ))}
       </View>
 
-      {/* ---------- Movement demo modal ---------- */}
-      <Modal
-        visible={demoTask !== null}
-        transparent
-        animationType="slide"
-        onRequestClose={() => setDemoTask(null)}
-      >
-        <View style={{ flex: 1, backgroundColor: "rgba(0,0,0,0.7)", justifyContent: "flex-end" }}>
-          <View style={[styles.card, { borderRadius: 20, paddingBottom: 36, maxHeight: "88%" }]}>
-            {demoTask && (() => {
-              const guide = WORKOUT_KINDS[demoTask.kind]!;
-              return (
-                <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ gap: 14 }}>
-                  {/* Task identity */}
-                  <View style={{ gap: 2 }}>
-                    <Text style={styles.miniNote}>{demoTask.timeText}</Text>
-                    <Text style={styles.label}>{demoTask.title}</Text>
-                  </View>
+      {/* ---------- Workout detail modal ---------- */}
+      <WorkoutDetailModal
+        task={workoutTask}
+        taskDone={tasks.find((t) => t.id === workoutTask?.id)?.done ?? false}
+        visible={workoutTask !== null}
+        onClose={() => setWorkoutTask(null)}
+        onCompleteTask={(id) => toggleTaskById(id)}
+      />
 
-                  {/* What it is */}
-                  <View style={{ gap: 6 }}>
-                    <Text style={styles.smallLabel}>What it is</Text>
-                    <Text style={styles.bodyMuted}>{guide.explanation}</Text>
-                  </View>
-
-                  {/* How to do it — only if steps provided */}
-                  {guide.steps && (
-                    <View style={{ gap: 6 }}>
-                      <Text style={styles.smallLabel}>How to do it</Text>
-                      {guide.steps.map((step, i) => (
-                        <Text key={i} style={styles.bodyMuted}>
-                          {i + 1}. {step}
-                        </Text>
-                      ))}
-                    </View>
-                  )}
-
-                  {/* Coaching cues */}
-                  <View style={{ gap: 6 }}>
-                    <Text style={styles.smallLabel}>Coaching cues</Text>
-                    {guide.cues.map((cue, i) => (
-                      <Text key={i} style={styles.bodyMuted}>· {cue}</Text>
-                    ))}
-                  </View>
-
-                  {/* Common mistake */}
-                  <View style={{ gap: 6 }}>
-                    <Text style={styles.smallLabel}>Common mistake</Text>
-                    <Text style={[styles.bodyMuted, { color: "#e07070" }]}>{guide.mistake}</Text>
-                  </View>
-
-                  <View style={{ height: 4 }} />
-                  <PrimaryButton title="Got it" onPress={() => setDemoTask(null)} />
-                </ScrollView>
-              );
-            })()}
-          </View>
-        </View>
-      </Modal>
+      {/* ---------- Task detail modal ---------- */}
+      <TaskDetailModal
+        task={detailTask}
+        visible={detailTask !== null}
+        onClose={() => setDetailTask(null)}
+        onToggle={(id) => {
+          toggleTaskById(id);
+          // Reflect toggled state immediately in the modal's task reference
+          setDetailTask((prev) => prev ? { ...prev, done: !prev.done } : null);
+        }}
+      />
 
       {/* ---------- Daily check-in modal ---------- */}
       <Modal
