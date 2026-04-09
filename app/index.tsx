@@ -180,6 +180,24 @@ type NutritionPlan = {
   groceryList: string[];
 };
 
+// Replace getRecoveryForTask() to connect to real data without touching this schema.
+type RecoveryStep = {
+  id:       string;
+  label:    string;   // "Foam Roll Quads", "Box Breathing", etc.
+  duration: string;   // "60 sec", "5 min", "8 hr" — displayed as-is
+  cue:      string;   // one-line coaching instruction
+};
+
+type RecoveryPlan = {
+  plan_id:      string;
+  type:         "Sleep" | "Stretch" | "Cold" | "Rest";  // drives the display colour + icon
+  title:        string;
+  focus:        string;        // one-sentence day-level objective
+  duration_min: number | null; // total duration in minutes (null = overnight / open)
+  steps:        RecoveryStep[];
+  coachingCue:  string;        // closing directive shown at the bottom
+};
+
 type TabKey = "Today" | "Schedule" | "Chat" | "Progress" | "Settings";
 
 // ---------- Helpers ----------
@@ -575,6 +593,82 @@ const DEV_MOCK_NUTRITION: NutritionPlan = {
  */
 function getNutritionForTask(_task: TimedTask): NutritionPlan {
   return DEV_MOCK_NUTRITION;
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─── Dev Mock Recovery Data ──────────────────────────────────────────────────
+// Four recovery archetypes — getRecoveryForTask() picks the right one by
+// matching the task title keywords. Replace with planner-linked data later.
+const DEV_MOCK_RECOVERY_STRETCH: RecoveryPlan = {
+  plan_id:      "mock-recovery-stretch",
+  type:         "Stretch",
+  title:        "Mobility & Stretch",
+  focus:        "Release tension in the key muscle groups worked today. Ten minutes of deliberate stretching compounds into real range of motion over time.",
+  duration_min: 15,
+  steps: [
+    { id: "rs1", label: "Hip Flexor Stretch",       duration: "60 sec / side", cue: "Lunge position — back knee down, drive hips forward. Breathe into the stretch." },
+    { id: "rs2", label: "Seated Hamstring Stretch",  duration: "60 sec / side", cue: "Hinge from the hip, not the lower back. Soft knee, not locked." },
+    { id: "rs3", label: "Thoracic Rotation",         duration: "10 reps / side", cue: "Slow and controlled. Stack your hands, rotate from the mid-back." },
+    { id: "rs4", label: "Chest Doorframe Stretch",   duration: "30 sec",        cue: "Arms at 90°, lean gently through the doorway. No bouncing." },
+    { id: "rs5", label: "Child's Pose Hold",         duration: "60 sec",        cue: "Arms extended, sink your hips back. Let gravity do the work." },
+  ],
+  coachingCue: "You don't need to be flexible to start — you need to start to become flexible. Ten minutes now prevents injuries that cost you weeks.",
+};
+
+const DEV_MOCK_RECOVERY_SLEEP: RecoveryPlan = {
+  plan_id:      "mock-recovery-sleep",
+  type:         "Sleep",
+  title:        "Sleep Protocol",
+  focus:        "Sleep is when your body rebuilds and your brain consolidates everything learned today. Protect it like the training session it is.",
+  duration_min: null,
+  steps: [
+    { id: "sl1", label: "Screens off",         duration: "30 min before bed", cue: "Phone on charger — out of reach. Blue light suppresses melatonin for up to 90 minutes." },
+    { id: "sl2", label: "Dim the lights",       duration: "30 min before bed", cue: "Bright overhead lights signal daytime. Switch to lamps or no lights at all." },
+    { id: "sl3", label: "Cool the room",        duration: "Now",               cue: "Target 18–20°C (65–68°F). Core temperature must drop for sleep onset." },
+    { id: "sl4", label: "Set a single alarm",   duration: "Now",               cue: "One alarm only. Multiple snooze alarms fragment your last sleep cycle — the most restorative one." },
+    { id: "sl5", label: "Lights out",           duration: "Target time",       cue: "Same time every night. Consistency is the most powerful sleep intervention that exists." },
+  ],
+  coachingCue: "Every hour of sleep before midnight is worth two after it. This is not optional recovery — it is mandatory maintenance.",
+};
+
+const DEV_MOCK_RECOVERY_COLD: RecoveryPlan = {
+  plan_id:      "mock-recovery-cold",
+  type:         "Cold",
+  title:        "Cold Exposure",
+  focus:        "Cold exposure reduces inflammation, spikes norepinephrine, and resets your nervous system. Three minutes is enough to earn the full effect.",
+  duration_min: 5,
+  steps: [
+    { id: "co1", label: "Preparation",     duration: "1 min",  cue: "Set water to 10–15°C if adjustable. Take three slow diaphragmatic breaths before entering." },
+    { id: "co2", label: "Cold exposure",   duration: "2–3 min", cue: "Stay calm. Nasal breathing only — do not hyperventilate. The discomfort is the point." },
+    { id: "co3", label: "Exit and warm up", duration: "1 min",  cue: "Air dry or towel off. Let your body generate its own heat — don't jump straight to a hot shower." },
+  ],
+  coachingCue: "The moment you want to quit is exactly when the adaptation is happening. Stay in. Breathe.",
+};
+
+const DEV_MOCK_RECOVERY_REST: RecoveryPlan = {
+  plan_id:      "mock-recovery-rest",
+  type:         "Rest",
+  title:        "Active Recovery",
+  focus:        "Low-intensity movement accelerates recovery more than complete rest. Keep the body moving without adding stress.",
+  duration_min: 20,
+  steps: [
+    { id: "re1", label: "Diaphragmatic breathing", duration: "5 min",  cue: "4 counts in through the nose, 6 counts out through the mouth. Activates the parasympathetic system." },
+    { id: "re2", label: "Foam roll — major groups", duration: "10 min", cue: "30–60 seconds per area. Pause on tight spots — don't roll through pain." },
+    { id: "re3", label: "Light static stretching",  duration: "5 min",  cue: "Target whatever is tightest today. No forcing — just hold and breathe." },
+  ],
+  coachingCue: "Rest days are not wasted days. Adaptation happens during recovery, not during training. Protect this time.",
+};
+
+/**
+ * Resolve a TimedTask to a RecoveryPlan by matching title keywords.
+ * V1: returns one of four mock archetypes. Replace with planner-linked data later.
+ */
+function getRecoveryForTask(task: TimedTask): RecoveryPlan {
+  const t = task.title.toLowerCase();
+  if (t.includes("sleep") || t.includes("wind") || t.includes("bed"))  return DEV_MOCK_RECOVERY_SLEEP;
+  if (t.includes("cold") || t.includes("plunge") || t.includes("ice")) return DEV_MOCK_RECOVERY_COLD;
+  if (t.includes("stretch") || t.includes("mobil") || t.includes("flex")) return DEV_MOCK_RECOVERY_STRETCH;
+  return DEV_MOCK_RECOVERY_REST;
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2043,6 +2137,362 @@ function NutritionDetailModal({
   );
 }
 
+// ---------- Recovery Detail Modal ----------
+function RecoveryDetailModal({
+  task,
+  taskDone,
+  visible,
+  onClose,
+  onCompleteTask,
+}: {
+  task:           TimedTask | null;
+  taskDone:       boolean;
+  visible:        boolean;
+  onClose:        () => void;
+  onCompleteTask: (id: string) => void;
+}) {
+  const [checkedSteps, setCheckedSteps] = React.useState<Set<string>>(new Set());
+
+  const plan        = task ? getRecoveryForTask(task) : null;
+  const totalSteps  = plan?.steps.length ?? 0;
+  const doneCount   = checkedSteps.size;
+  const allDone     = totalSteps > 0 && doneCount === totalSteps;
+  const progressPct = totalSteps > 0 ? Math.round((doneCount / totalSteps) * 100) : 0;
+
+  // Reset or pre-fill when modal opens
+  React.useEffect(() => {
+    if (!visible || !plan) return;
+    if (taskDone) {
+      setCheckedSteps(new Set(plan.steps.map((s) => s.id)));
+    } else {
+      setCheckedSteps(new Set());
+    }
+  }, [visible]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Auto-complete when all steps checked
+  React.useEffect(() => {
+    if (allDone && !taskDone && task) {
+      onCompleteTask(task.id);
+    }
+  }, [allDone]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  if (!task || !plan) return null;
+
+  const RECOVERY_COLOR = KIND_COLORS.Recovery?.color ?? "#ce93d8";
+  const RECOVERY_BG    = KIND_COLORS.Recovery?.backgroundColor ?? "#1a0a20";
+  const GREEN          = "#66bb6a";
+
+  // Sleep type uses a softer blue-grey accent for the stat card
+  const statColor = plan.type === "Sleep" ? "#90a4ae" : RECOVERY_COLOR;
+
+  const toggleStep = (id: string) => {
+    setCheckedSteps((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const ctaLabel = taskDone
+    ? "Mark incomplete"
+    : plan.type === "Sleep"   ? "Sleep protocol complete"
+    : plan.type === "Cold"    ? "Cold exposure complete"
+    : plan.type === "Stretch" ? "Mobility complete"
+    : "Recovery complete";
+
+  const doneBannerLabel = plan.type === "Sleep"   ? "Sleep protocol locked in"
+    : plan.type === "Cold"    ? "Cold exposure done"
+    : plan.type === "Stretch" ? "Mobility complete"
+    : "Recovery complete";
+
+  return (
+    <Modal
+      visible={visible}
+      animationType="slide"
+      onRequestClose={onClose}
+    >
+      <SafeAreaView style={{ flex: 1, backgroundColor: "#06060c" }}>
+        <StatusBar barStyle="light-content" />
+
+        {/* ── Top bar ────────────────────────────────────────────────────────── */}
+        <View style={{
+          flexDirection: "row",
+          alignItems: "center",
+          paddingHorizontal: 20,
+          paddingTop: 10,
+          paddingBottom: 14,
+        }}>
+          <Pressable
+            onPress={onClose}
+            hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+            style={{
+              width: 36,
+              height: 36,
+              borderRadius: 18,
+              backgroundColor: "#0e0e18",
+              borderWidth: 1,
+              borderColor: "#1e1e2e",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            <Text style={{ color: "#5a5a7a", fontSize: 14, fontWeight: "700", lineHeight: 16 }}>✕</Text>
+          </Pressable>
+
+          <View style={{ flex: 1 }} />
+
+          {/* Steps progress pill */}
+          <View style={{
+            backgroundColor: doneCount > 0 ? RECOVERY_COLOR + "18" : "#0e0e18",
+            borderWidth: 1,
+            borderColor: doneCount > 0 ? RECOVERY_COLOR + "40" : "#1e1e2e",
+            borderRadius: 10,
+            paddingHorizontal: 12,
+            paddingVertical: 6,
+          }}>
+            <Text style={{
+              color: doneCount > 0 ? RECOVERY_COLOR : "#3a3a5a",
+              fontSize: 12,
+              fontWeight: "800",
+              letterSpacing: 0.3,
+            }}>
+              {doneCount}/{totalSteps} steps
+            </Text>
+          </View>
+        </View>
+
+        <ScrollView
+          showsVerticalScrollIndicator={false}
+          contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 56 }}
+        >
+
+          {/* ── Identity ──────────────────────────────────────────────────────── */}
+          <View style={{ marginBottom: 26 }}>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 14 }}>
+              <View style={{ backgroundColor: RECOVERY_BG, borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3 }}>
+                <Text style={{ color: RECOVERY_COLOR, fontSize: 10, fontWeight: "800", letterSpacing: 0.8 }}>RECOVERY</Text>
+              </View>
+              <Text style={{ color: "#3a3a5a", fontSize: 11, fontWeight: "600" }}>{task.timeText}</Text>
+            </View>
+
+            <Text style={{
+              color: "#eeeef5",
+              fontSize: 24,
+              fontWeight: "900",
+              letterSpacing: -0.6,
+              lineHeight: 30,
+              marginBottom: 8,
+            }}>
+              {task.title}
+            </Text>
+            <Text style={{ color: "#4a4a7a", fontSize: 13, fontWeight: "500", lineHeight: 20 }}>
+              {plan.focus}
+            </Text>
+          </View>
+
+          {/* ── Duration stat card ────────────────────────────────────────────── */}
+          {(plan.duration_min != null || plan.type === "Sleep") && (
+            <View style={{
+              backgroundColor: "#0a0a14",
+              borderWidth: 1,
+              borderColor: "#1a1a2a",
+              borderRadius: 14,
+              padding: 16,
+              flexDirection: "row",
+              alignItems: "center",
+              justifyContent: "space-between",
+              marginBottom: 28,
+            }}>
+              <View style={{ gap: 4 }}>
+                <Text style={{ color: statColor, fontSize: 28, fontWeight: "900", letterSpacing: -1 }}>
+                  {plan.type === "Sleep" ? "8 hr" : `${plan.duration_min} min`}
+                </Text>
+                <Text style={{ color: "#40405a", fontSize: 10, fontWeight: "800", letterSpacing: 1 }}>
+                  {plan.type === "Sleep" ? "TARGET SLEEP" : "DURATION"}
+                </Text>
+              </View>
+              <View style={{
+                backgroundColor: RECOVERY_COLOR + "12",
+                borderRadius: 10,
+                paddingHorizontal: 12,
+                paddingVertical: 6,
+              }}>
+                <Text style={{ color: RECOVERY_COLOR, fontSize: 11, fontWeight: "800", letterSpacing: 0.5 }}>
+                  {plan.type.toUpperCase()}
+                </Text>
+              </View>
+            </View>
+          )}
+
+          {/* ── Progress bar ──────────────────────────────────────────────────── */}
+          <View style={{ marginBottom: 28 }}>
+            <View style={{ height: 3, backgroundColor: "#111120", borderRadius: 2, overflow: "hidden", marginBottom: 8 }}>
+              <View style={{
+                height: 3,
+                width: `${progressPct}%` as any,
+                backgroundColor: allDone ? GREEN : RECOVERY_COLOR,
+                borderRadius: 2,
+              }} />
+            </View>
+            <Text style={{ color: "#3a3a5a", fontSize: 11, fontWeight: "600" }}>
+              {allDone
+                ? "All steps complete"
+                : doneCount > 0
+                  ? `${doneCount} of ${totalSteps} steps done`
+                  : `${totalSteps} steps`}
+            </Text>
+          </View>
+
+          {/* ── Step cards ────────────────────────────────────────────────────── */}
+          <Text style={{ color: "#40405a", fontSize: 10, fontWeight: "800", letterSpacing: 1, marginBottom: 12 }}>
+            STEPS
+          </Text>
+          <View style={{ gap: 8, marginBottom: 32 }}>
+            {plan.steps.map((step) => {
+              const done = checkedSteps.has(step.id);
+              return (
+                <Pressable
+                  key={step.id}
+                  onPress={() => toggleStep(step.id)}
+                  style={{
+                    backgroundColor: done ? "#080808" : "#0c0c18",
+                    borderWidth: 1,
+                    borderColor: done ? "#111118" : "#1c1c2c",
+                    borderRadius: 14,
+                    flexDirection: "row",
+                    alignItems: "flex-start",
+                    padding: 16,
+                    gap: 14,
+                  }}
+                >
+                  {/* Checkbox */}
+                  <View style={{
+                    width: 22,
+                    height: 22,
+                    borderRadius: 6,
+                    borderWidth: 1.5,
+                    borderColor: done ? GREEN : "#2e2e42",
+                    backgroundColor: done ? GREEN + "14" : "transparent",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    marginTop: 1,
+                    flexShrink: 0,
+                  }}>
+                    {done && (
+                      <Text style={{ color: GREEN, fontSize: 11, fontWeight: "900", lineHeight: 14 }}>✓</Text>
+                    )}
+                  </View>
+
+                  {/* Step info */}
+                  <View style={{ flex: 1, gap: 4 }}>
+                    {/* Label + duration */}
+                    <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                      <Text style={{
+                        color: done ? "#404040" : "#d0d0dc",
+                        fontSize: 14,
+                        fontWeight: "700",
+                        textDecorationLine: done ? "line-through" : "none",
+                        flex: 1,
+                      }}>
+                        {step.label}
+                      </Text>
+                      <Text style={{
+                        color: done ? "#2a2a2a" : RECOVERY_COLOR + "88",
+                        fontSize: 11,
+                        fontWeight: "700",
+                        flexShrink: 0,
+                      }}>
+                        {step.duration}
+                      </Text>
+                    </View>
+
+                    {/* Coaching cue */}
+                    <Text style={{
+                      color: done ? "#282828" : "#505068",
+                      fontSize: 12,
+                      lineHeight: 18,
+                      fontWeight: "500",
+                      marginTop: 2,
+                    }}>
+                      {step.cue}
+                    </Text>
+                  </View>
+                </Pressable>
+              );
+            })}
+          </View>
+
+          {/* ── Coaching cue card ─────────────────────────────────────────────── */}
+          <View style={{
+            backgroundColor: "#08080f",
+            borderWidth: 1,
+            borderColor: "#141420",
+            borderRadius: 14,
+            padding: 16,
+            marginBottom: 24,
+            gap: 8,
+          }}>
+            <Text style={{ color: "#40405a", fontSize: 10, fontWeight: "800", letterSpacing: 1 }}>
+              COACHING CUE
+            </Text>
+            <Text style={{ color: "#6060a0", fontSize: 13, lineHeight: 21, fontStyle: "italic" }}>
+              {plan.coachingCue}
+            </Text>
+          </View>
+
+          {/* ── All done banner ───────────────────────────────────────────────── */}
+          {allDone && (
+            <View style={{
+              backgroundColor: GREEN + "0a",
+              borderWidth: 1,
+              borderColor: GREEN + "25",
+              borderRadius: 14,
+              padding: 16,
+              alignItems: "center",
+              marginBottom: 20,
+              gap: 4,
+            }}>
+              <Text style={{ color: GREEN, fontSize: 15, fontWeight: "800" }}>{doneBannerLabel}</Text>
+              <Text style={{ color: GREEN + "80", fontSize: 12 }}>Recovery done for today.</Text>
+            </View>
+          )}
+
+          {/* ── Completion button ─────────────────────────────────────────────── */}
+          <Pressable
+            onPress={() => {
+              if (!taskDone) {
+                setCheckedSteps(new Set(plan.steps.map((s) => s.id)));
+                onCompleteTask(task.id);
+              } else {
+                onCompleteTask(task.id);
+                onClose();
+              }
+            }}
+            style={{
+              backgroundColor: taskDone ? "#0e0e0e" : RECOVERY_COLOR,
+              borderWidth: 1,
+              borderColor: taskDone ? "#1e1e1e" : RECOVERY_COLOR,
+              borderRadius: 14,
+              paddingVertical: 16,
+              alignItems: "center",
+            }}
+          >
+            <Text style={{
+              color: taskDone ? "#444" : "#0a0010",
+              fontSize: 15,
+              fontWeight: "800",
+              letterSpacing: 0.2,
+            }}>
+              {ctaLabel}
+            </Text>
+          </Pressable>
+
+        </ScrollView>
+      </SafeAreaView>
+    </Modal>
+  );
+}
+
 // ---------- Task Detail Modal ----------
 function TaskDetailModal({
   task,
@@ -2673,6 +3123,7 @@ export default function Index() {
   const [detailTask,     setDetailTask]     = useState<TimedTask | null>(null);
   const [workoutTask,    setWorkoutTask]    = useState<TimedTask | null>(null);
   const [nutritionTask,  setNutritionTask]  = useState<TimedTask | null>(null);
+  const [recoveryTask,   setRecoveryTask]   = useState<TimedTask | null>(null);
 
   // profile/auth
   const [authed, setAuthed] = useState(false);
@@ -3834,8 +4285,9 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
                 task={task}
                 onToggle={() => toggleTask(task.id)}
                 onDetail={() => {
-                  if (task.kind === "Workout")   setWorkoutTask(task);
+                  if (task.kind === "Workout")        setWorkoutTask(task);
                   else if (task.kind === "Nutrition") setNutritionTask(task);
+                  else if (task.kind === "Recovery")  setRecoveryTask(task);
                   else setDetailTask(task);
                 }}
               />
@@ -4751,6 +5203,15 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
         taskDone={tasks.find((t) => t.id === nutritionTask?.id)?.done ?? false}
         visible={nutritionTask !== null}
         onClose={() => setNutritionTask(null)}
+        onCompleteTask={(id) => { toggleTaskById(id); }}
+      />
+
+      {/* ---------- Recovery detail modal ---------- */}
+      <RecoveryDetailModal
+        task={recoveryTask}
+        taskDone={tasks.find((t) => t.id === recoveryTask?.id)?.done ?? false}
+        visible={recoveryTask !== null}
+        onClose={() => setRecoveryTask(null)}
         onCompleteTask={(id) => { toggleTaskById(id); }}
       />
 
