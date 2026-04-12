@@ -2493,6 +2493,235 @@ function RecoveryDetailModal({
   );
 }
 
+// ---------- Habit content map ----------
+type HabitContent = {
+  description: string;  // 1–2 lines: the "why" behind this habit
+  instruction: string;  // what to do right now — one sentence
+  coachingCue: string;  // short, punchy, no filler
+};
+
+function getHabitContent(task: TimedTask): HabitContent {
+  const t = task.title.toLowerCase();
+
+  if (t.includes("cold shower") || (t.includes("cold") && t.includes("shower")))
+    return {
+      description: "Cold exposure resets your nervous system, boosts alertness, and reinforces that you can do hard things on demand.",
+      instruction: "Step in, turn it cold, stay for 60–90 seconds. Breathe through it.",
+      coachingCue: "The discomfort is the point. Every second you stay is a rep of discipline.",
+    };
+
+  if (t.includes("journal") || t.includes("journaling") || t.includes("morning pages") || t.includes("writing"))
+    return {
+      description: "Daily writing clears mental noise, surfaces what actually matters, and compounds into self-awareness over months.",
+      instruction: "Open the page and write — anything. No editing, no rereading. Just output.",
+      coachingCue: "You don't journal to record your life. You journal to understand it.",
+    };
+
+  if (t.includes("meditat") || t.includes("breathwork") || t.includes("mindful") || t.includes("breathing"))
+    return {
+      description: "Five minutes of deliberate stillness lowers cortisol, sharpens focus, and builds the capacity to stay calm under pressure.",
+      instruction: "Sit, close your eyes, breathe in for 4 counts, out for 6. Stay with it.",
+      coachingCue: "Your mind will wander. Noticing that and returning — that is the practice.",
+    };
+
+  if (t.includes("read") || t.includes("book") || t.includes("pages"))
+    return {
+      description: "Consistent reading compounds into an edge. Thirty minutes a day is twenty books a year.",
+      instruction: "Open the book. Read until the timer goes — no switching to your phone.",
+      coachingCue: "It doesn't matter how fast. It matters that you showed up.",
+    };
+
+  if (t.includes("walk") || t.includes("steps") || t.includes("outdoor"))
+    return {
+      description: "A short walk lowers cortisol, clears decision fatigue, and adds low-intensity movement that compounds into real results over time.",
+      instruction: "Get outside, move at a brisk pace, and leave the phone in your pocket.",
+      coachingCue: "The walk is not nothing. It is everything small that builds the person you are becoming.",
+    };
+
+  if (t.includes("no alcohol") || t.includes("alcohol-free") || t.includes("sober") || t.includes("no drink"))
+    return {
+      description: "Skipping alcohol today protects your sleep architecture, recovery, and hormone levels — gains that are invisible but real.",
+      instruction: "Choose your alternative drink now. Decide before the moment, not in it.",
+      coachingCue: "You are not missing out. You are outcompeting the version of you that would have said yes.",
+    };
+
+  if (t.includes("vitamin") || t.includes("supplement") || t.includes("omega") || t.includes("creatine"))
+    return {
+      description: "Consistent supplementation only works when it is truly consistent. Miss one day and the benefit compounds backward.",
+      instruction: "Take them now with water. Don't think about it — just do it.",
+      coachingCue: "The habit is the discipline. The supplement is just the object.",
+    };
+
+  if (t.includes("gratitude") || t.includes("grateful"))
+    return {
+      description: "A daily gratitude practice shifts baseline attention from what is missing to what is working — a measurable mood upgrade over weeks.",
+      instruction: "Write three specific things you are grateful for. No generic answers.",
+      coachingCue: "Specific beats vague. 'My coffee was perfect this morning' beats 'I'm grateful for life.'",
+    };
+
+  // Generic fallback — works for any habit the AI generates
+  return {
+    description: "Showing up for this habit today is a vote for the person you are building. Consistency beats intensity every time.",
+    instruction: "Do it now, exactly as planned. No modifications, no delays.",
+    coachingCue: "You don't need to feel like it. You just need to do it.",
+  };
+}
+
+// ---------- Habit Detail Modal ----------
+function HabitDetailModal({
+  task,
+  taskDone,
+  visible,
+  onClose,
+  onToggle,
+}: {
+  task:     TimedTask | null;
+  taskDone: boolean;
+  visible:  boolean;
+  onClose:  () => void;
+  onToggle: (id: string) => void;
+}) {
+  if (!task) return null;
+
+  const content      = getHabitContent(task);
+  const HABIT_COLOR  = KIND_COLORS.Habit?.color          ?? "#ef9a9a";
+  const HABIT_BG     = KIND_COLORS.Habit?.backgroundColor ?? "#200a0a";
+  const duration     = KIND_DURATION[task.kind];
+  const priority     = task.priority ?? "medium";
+  const priorityColor =
+    priority === "high"   ? "#FF5252" :
+    priority === "medium" ? "#FFB300" : "#555";
+  const priorityLabel = priority === "high" ? "REQUIRED" : "OPTIONAL";
+
+  return (
+    <Modal
+      visible={visible}
+      transparent
+      animationType="slide"
+      onRequestClose={onClose}
+    >
+      <Pressable
+        style={{ flex: 1, backgroundColor: "rgba(0,0,0,0.55)", justifyContent: "flex-end" }}
+        onPress={onClose}
+      >
+        <Pressable onPress={() => {}} style={{ maxHeight: "72%" }}>
+          <View style={{
+            backgroundColor: "#0a0a0f",
+            borderTopLeftRadius: 24,
+            borderTopRightRadius: 24,
+            overflow: "hidden",
+          }}>
+
+            {/* Drag handle */}
+            <View style={{ alignItems: "center", paddingTop: 12, paddingBottom: 4 }}>
+              <View style={{ width: 36, height: 4, borderRadius: 2, backgroundColor: "#1e1e2e" }} />
+            </View>
+
+            <ScrollView
+              showsVerticalScrollIndicator={false}
+              contentContainerStyle={{ paddingHorizontal: 24, paddingBottom: 36 }}
+            >
+              {/* ── Kind + priority header ─────────────────────────────────────── */}
+              <View style={{
+                flexDirection: "row",
+                alignItems: "center",
+                justifyContent: "space-between",
+                paddingTop: 14,
+                paddingBottom: 18,
+              }}>
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                  <View style={{ backgroundColor: HABIT_BG, borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3 }}>
+                    <Text style={{ color: HABIT_COLOR, fontSize: 10, fontWeight: "800", letterSpacing: 0.8 }}>HABIT</Text>
+                  </View>
+                  {duration && (
+                    <Text style={{ color: "#3a3a5a", fontSize: 11, fontWeight: "600" }}>{duration}</Text>
+                  )}
+                </View>
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                  <Text style={{ color: "#3a3a5a", fontSize: 11, fontWeight: "600" }}>{task.timeText}</Text>
+                  <View style={{ backgroundColor: priorityColor + "18", borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3 }}>
+                    <Text style={{ color: priorityColor, fontSize: 10, fontWeight: "800", letterSpacing: 0.8 }}>
+                      {priorityLabel}
+                    </Text>
+                  </View>
+                </View>
+              </View>
+
+              {/* ── Title ─────────────────────────────────────────────────────────── */}
+              <Text style={{
+                color: taskDone ? "#555" : "#eeeef5",
+                fontSize: 22,
+                fontWeight: "800",
+                lineHeight: 28,
+                letterSpacing: -0.4,
+                textDecorationLine: taskDone ? "line-through" : "none",
+                marginBottom: 10,
+              }}>
+                {task.title}
+              </Text>
+
+              {/* ── Description ───────────────────────────────────────────────────── */}
+              <Text style={{
+                color: "#606078",
+                fontSize: 13,
+                lineHeight: 20,
+                fontWeight: "500",
+                marginBottom: 24,
+              }}>
+                {content.description}
+              </Text>
+
+              {/* ── Instruction + cue card ────────────────────────────────────────── */}
+              <View style={{
+                backgroundColor: "#080810",
+                borderWidth: 1,
+                borderColor: "#14142a",
+                borderRadius: 14,
+                padding: 16,
+                gap: 10,
+                marginBottom: 28,
+              }}>
+                <Text style={{ color: "#50507a", fontSize: 10, fontWeight: "800", letterSpacing: 1 }}>
+                  DO THIS NOW
+                </Text>
+                <Text style={{ color: "#9090b8", fontSize: 14, lineHeight: 22, fontWeight: "500" }}>
+                  {content.instruction}
+                </Text>
+                <View style={{ height: 1, backgroundColor: "#111120" }} />
+                <Text style={{ color: "#5050a0", fontSize: 12, lineHeight: 18, fontStyle: "italic" }}>
+                  {content.coachingCue}
+                </Text>
+              </View>
+
+              {/* ── CTA ──────────────────────────────────────────────────────────── */}
+              <Pressable
+                onPress={() => { onToggle(task.id); onClose(); }}
+                style={{
+                  backgroundColor: taskDone ? "#0e0e0e" : HABIT_COLOR,
+                  borderWidth: 1,
+                  borderColor: taskDone ? "#1e1e1e" : HABIT_COLOR,
+                  borderRadius: 14,
+                  paddingVertical: 16,
+                  alignItems: "center",
+                }}
+              >
+                <Text style={{
+                  color: taskDone ? "#444" : "#1a0505",
+                  fontSize: 15,
+                  fontWeight: "800",
+                  letterSpacing: 0.2,
+                }}>
+                  {taskDone ? "Mark incomplete" : "Complete habit"}
+                </Text>
+              </Pressable>
+            </ScrollView>
+          </View>
+        </Pressable>
+      </Pressable>
+    </Modal>
+  );
+}
+
 // ---------- Task Detail Modal ----------
 function TaskDetailModal({
   task,
@@ -3124,6 +3353,7 @@ export default function Index() {
   const [workoutTask,    setWorkoutTask]    = useState<TimedTask | null>(null);
   const [nutritionTask,  setNutritionTask]  = useState<TimedTask | null>(null);
   const [recoveryTask,   setRecoveryTask]   = useState<TimedTask | null>(null);
+  const [habitTask,      setHabitTask]      = useState<TimedTask | null>(null);
 
   // profile/auth
   const [authed, setAuthed] = useState(false);
@@ -4288,6 +4518,7 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
                   if (task.kind === "Workout")        setWorkoutTask(task);
                   else if (task.kind === "Nutrition") setNutritionTask(task);
                   else if (task.kind === "Recovery")  setRecoveryTask(task);
+                  else if (task.kind === "Habit")     setHabitTask(task);
                   else setDetailTask(task);
                 }}
               />
@@ -5213,6 +5444,15 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
         visible={recoveryTask !== null}
         onClose={() => setRecoveryTask(null)}
         onCompleteTask={(id) => { toggleTaskById(id); }}
+      />
+
+      {/* ---------- Habit detail modal ---------- */}
+      <HabitDetailModal
+        task={habitTask}
+        taskDone={tasks.find((t) => t.id === habitTask?.id)?.done ?? false}
+        visible={habitTask !== null}
+        onClose={() => setHabitTask(null)}
+        onToggle={(id) => { toggleTaskById(id); }}
       />
 
       {/* ---------- Task detail modal ---------- */}
