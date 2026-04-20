@@ -1,3 +1,4 @@
+import { Ionicons } from "@expo/vector-icons";
 import React, { useState } from "react";
 import {
   KeyboardAvoidingView,
@@ -17,11 +18,12 @@ interface Props {
 }
 
 export default function AuthScreen({ onSuccess }: Props) {
-  const [mode, setMode]         = useState<"signin" | "signup">("signin");
-  const [email, setEmail]       = useState("");
-  const [password, setPassword] = useState("");
-  const [error, setError]       = useState("");
-  const [loading, setLoading]   = useState(false);
+  const [mode, setMode]             = useState<"signin" | "signup">("signin");
+  const [email, setEmail]           = useState("");
+  const [password, setPassword]     = useState("");
+  const [showPassword, setShowPass] = useState(false);
+  const [error, setError]           = useState("");
+  const [loading, setLoading]       = useState(false);
 
   const handleSubmit = async () => {
     setError("");
@@ -78,14 +80,27 @@ export default function AuthScreen({ onSuccess }: Props) {
             value={email}
             onChangeText={(v) => { setEmail(v); setError(""); }}
           />
-          <TextInput
-            style={s.input}
-            placeholder="Password"
-            placeholderTextColor="#555"
-            secureTextEntry
-            value={password}
-            onChangeText={(v) => { setPassword(v); setError(""); }}
-          />
+          <View style={s.passwordRow}>
+            <TextInput
+              style={[s.input, { flex: 1 }]}
+              placeholder="Password"
+              placeholderTextColor="#555"
+              secureTextEntry={!showPassword}
+              value={password}
+              onChangeText={(v) => { setPassword(v); setError(""); }}
+            />
+            <Pressable
+              style={s.eyeBtn}
+              onPress={() => setShowPass((p) => !p)}
+              hitSlop={8}
+            >
+              <Ionicons
+                name={showPassword ? "eye-off-outline" : "eye-outline"}
+                size={20}
+                color="#555"
+              />
+            </Pressable>
+          </View>
 
           {!!error && <Text style={s.errorText}>{error}</Text>}
 
@@ -127,6 +142,14 @@ const s = StyleSheet.create({
   sub:     { color: "#bdbdbd", fontSize: 15 },
 
   form:    { gap: 12 },
+  passwordRow: { flexDirection: "row", alignItems: "center", gap: 0 },
+  eyeBtn: {
+    position: "absolute",
+    right: 14,
+    top: 0,
+    bottom: 0,
+    justifyContent: "center",
+  },
   input: {
     backgroundColor: "#0f0f0f",
     borderWidth: 1,

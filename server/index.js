@@ -154,6 +154,59 @@ Schema:
 `.trim();
 }
 
+// ---------- Auth (in-memory, dev-grade) ----------
+const authUsers  = new Map(); // email → { id, email, hash, salt }
+const authTokens = new Map(); // token → { id, email, expiresAt }
+
+function hashPassword(password, salt) {
+  return crypto.scryptSync(password, salt, 64).toString("hex");
+}
+
+function makeToken(userId, email) {
+  const token = crypto.randomUUID();
+  authTokens.set(token, { id: userId, email, expiresAt: Date.now() + 7 * 24 * 3600 * 1000 });
+  return token;
+}
+
+app.post("/api/auth/signup", (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error: "Email and password are required." });
+  if (password.length < 6)  return res.status(400).json({ error: "Password must be at least 6 characters." });
+
+  const key = email.trim().toLowerCase();
+  if (authUsers.has(key)) return res.status(409).json({ error: "Account already exists. Try signing in instead." });
+
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = hashPassword(password, salt);
+  const id   = crypto.randomUUID();
+  authUsers.set(key, { id, email: key, hash, salt });
+
+  const token = makeToken(id, key);
+  return res.json({ token, user: { id, email: key } });
+});
+
+app.post("/api/auth/signin", (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error: "Email and password are required." });
+
+  const key  = email.trim().toLowerCase();
+  const user = authUsers.get(key);
+  if (!user) return res.status(401).json({ error: "Invalid email or password." });
+
+  const hash = hashPassword(password, user.salt);
+  if (hash !== user.hash) return res.status(401).json({ error: "Invalid email or password." });
+
+  const token = makeToken(user.id, key);
+  return res.json({ token, user: { id: user.id, email: key } });
+});
+
+app.post("/api/auth/signout", (req, res) => {
+  const auth = req.headers["authorization"] ?? "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  if (token) authTokens.delete(token);
+  return res.json({ ok: true });
+});
+
 app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
