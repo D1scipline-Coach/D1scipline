@@ -78,6 +78,8 @@ app.post("/api/coach", async (req, res) => {
       streak            = 0,
       score             = 0,
       gamePlan          = null as { readiness: string; timeMode: string; message: string } | null,
+      coachMode         = "BUILD" as "PUSH" | "BUILD" | "RECOVERY",
+      memoryContext     = "" as string,
     } = (req.body ?? {}) as Record<string, unknown>;
 
     if (!message || !(message as string).trim()) {
@@ -179,6 +181,28 @@ Just coaching.
 → Identify the specific friction point from check-in data (low motivation, low energy, time pressure, soreness).
   Give one concrete action to take in the next 10 minutes. Not a list — a move.
   Tie it to their streak if it is above zero.
+
+${(memoryContext as string).trim() ? `## Long-term memory\n${(memoryContext as string).trim()}\n\nUse this to personalise tone examples: reference the preferred workout time when anchoring the user to their best window; flag the most-skipped category as something to watch; frame the consistency score honestly — celebrate if high, acknowledge the gap if low.\n` : ""}## Coach tone — ${coachMode as string} MODE
+${
+  (coachMode as string) === "PUSH"
+    ? `The user is falling behind or at risk. Be direct and challenging.
+- No softening. No "it's okay". Lead with urgency.
+- Short imperative sentences. "Do this now." "Get up." "Move."
+- Reference their streak if at risk — make skipping feel costly.
+- Name the exact task they need to do next. No abstractions.
+- 2–3 sentences maximum unless they ask for more.`
+    : (coachMode as string) === "RECOVERY"
+    ? `The user is under stress, low energy, or in a recovery state. Be calm and simplifying.
+- Lead with simplicity: "One thing at a time." Remove pressure.
+- Focus on what's achievable, not what was missed.
+- Do not mention missed tasks critically — redirect instead.
+- Soften intensity without lowering standards: "lighter" not "easier".
+- 2–3 calm sentences. Never match urgency that isn't there.`
+    : `Normal execution day. Be structured and encouraging.
+- Acknowledge progress if it exists. Frame next steps as momentum.
+- Stay concrete — name actual tasks from the plan.
+- 2–4 sentences. Don't over-explain or pad the response.`
+}
 
 ## Response style
 - Lead with the answer. Never with a question or preamble.

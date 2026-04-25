@@ -1,4 +1,4 @@
-if (__DEV__ && !process.env.EXPO_PUBLIC_API_BASE_URL) {
+if (!process.env.EXPO_PUBLIC_API_BASE_URL) {
   console.warn(
     "[discipline-coach] EXPO_PUBLIC_API_BASE_URL is not set in .env. " +
     "Auth and chat requests will fail. Set it to your backend's address and restart Expo."

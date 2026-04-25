@@ -49,13 +49,39 @@ export const PlannerProfileSchema = z.object({
   goal:               z.string().min(1).max(200),
   wake:               z.string().min(1).max(20),
   sleep:              z.string().min(1).max(20),
+  // ── New performance profile fields ─────────────────────────────────────
+  age:                z.string().max(10).optional(),
+  gender:             z.enum(["male", "female", "other"]).optional(),
+  height:             z.string().max(30).optional(),
+  weight:             z.string().max(30).optional(),
+  bodyFatPercentage:  z.string().max(20).optional(),
+  gymAccess:          z.enum(["full_gym", "limited_equipment", "bodyweight_only"]).optional(),
+  primaryTrainingStyle: z.enum(["athlete", "muscle", "strength", "fat_loss", "general_fitness", "calisthenics"]).optional(),
+  goalType:           z.enum(["lose_fat", "build_muscle", "get_stronger", "improve_athleticism", "stay_consistent"]).optional(),
+  goalNotes:          z.string().max(400).optional(),
+  trainingDaysPerWeek: z.number().int().min(2).max(7).optional(),
+  // ── Phase 1 additions ─────────────────────────────────────────────────
+  goalUrgency:          z.enum(["gradual", "steady", "aggressive"]).optional(),
+  injuries:             z.string().max(300).optional(),
+  dietaryStyle:         z.enum(["everything", "vegetarian", "vegan", "pescatarian", "keto", "gluten_free"]).optional(),
+  nutritionGoal:        z.enum(["fat_loss", "muscle_gain", "maintenance", "performance"]).optional(),
+  mealPrepLevel:        z.enum(["minimal", "moderate", "full_prep"]).optional(),
+  sleepQuality:         z.enum(["poor", "fair", "good", "great"]).optional(),
+  stressLevel:          z.enum(["low", "moderate", "high", "very_high"]).optional(),
+  energyBaseline:       z.enum(["low", "moderate", "high"]).optional(),
+  preferredWorkoutTime: z.enum(["early_morning", "morning", "afternoon", "evening", "night"]).optional(),
+  scheduleConsistency:  z.enum(["very_consistent", "somewhat_consistent", "inconsistent"]).optional(),
+  // ── Food safety ────────────────────────────────────────────────────────
+  foodAllergies:        z.array(z.string().max(50)).max(20).optional(),
+  allergyNotes:         z.string().max(400).optional(),
+  // ── Legacy fields — kept for backward compat ───────────────────────────
   startingPoint:      z.string().max(200).optional(),
   targetGoal:         z.string().max(200).optional(),
   bodyFatDirection:   z.enum(["lose_fat", "maintain", "build_lean"]).optional(),
   experienceLevel:    z.enum(["beginner", "intermediate", "advanced"]).optional(),
   equipment:          z.enum(["none", "minimal", "full_gym"]).optional(),
   workoutFrequency:   z.enum(["2x", "3x", "4x", "5x"]).optional(),
-  dailyTrainingTime:  z.enum(["20min", "30min", "45min", "60min"]).optional(),
+  dailyTrainingTime:  z.enum(["20min", "30min", "45min", "60min", "90min+"]).optional(),
 });
 
 export const PlannerScheduleBlockSchema = z.object({
@@ -87,9 +113,10 @@ export const TaskFeedbackEntrySchema = z.object({
 });
 
 export const PlannerBehaviorSchema = z.object({
-  streak:       z.number().int().min(0).max(3650),
-  score:        z.number().min(0).max(100),
-  taskFeedback: z.array(TaskFeedbackEntrySchema).max(50).optional(),
+  streak:        z.number().int().min(0).max(3650),
+  score:         z.number().min(0).max(100),
+  taskFeedback:  z.array(TaskFeedbackEntrySchema).max(50).optional(),
+  patternHints:  z.string().max(500).optional(), // client-derived behavior pattern summary
 });
 
 export const PlannerGamePlanSchema = z
@@ -137,6 +164,15 @@ export const RegeneratePlanInputSchema = PlannerInputSchema.extend({
 // reaches the client without passing this schema first.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// AI-generated exercise entry — attached to Workout tasks only
+export const AIWorkoutExerciseSchema = z.object({
+  name:   z.string().min(1).max(100),
+  sets:   z.number().int().min(1).max(10),
+  reps:   z.string().min(1).max(20),   // "10", "6-8", "AMRAP"
+  rest:   z.string().max(20).optional(),
+  notes:  z.string().max(300).optional(),
+});
+
 export const AITaskOutputSchema = z.object({
   id:        z.string().min(1).max(50),
   timeText:  z.string().min(1).max(20),
@@ -144,7 +180,11 @@ export const AITaskOutputSchema = z.object({
   kind:      TaskKindSchema,
   priority:  TaskPrioritySchema,
   rationale: z.string().min(1).max(400),
+  // Present only on Workout tasks — carries the full exercise structure
+  exercises: z.array(AIWorkoutExerciseSchema).min(1).max(8).optional(),
 });
+
+export type AIWorkoutExerciseData = z.infer<typeof AIWorkoutExerciseSchema>;
 
 export const AIPlannerOutputSchema = z
   .object({
@@ -154,6 +194,21 @@ export const AIPlannerOutputSchema = z
     fallbackPlan:     z.string().min(1).max(300),
     tasks:            z.array(AITaskOutputSchema).min(1).max(15),
   });
+
+// Multi-day AI output — each day has its own task list and purpose label
+export const AIProgramDaySchema = z.object({
+  dayIndex: z.number().int().min(0).max(6),
+  purpose:  z.string().max(200).optional(),
+  tasks:    z.array(AITaskOutputSchema).min(1).max(15),
+});
+
+export const MultiDayAIPlannerOutputSchema = z.object({
+  summary:          z.string().min(1).max(600),
+  coachingNote:     z.string().min(1).max(600),
+  disciplineTarget: z.string().min(1).max(300),
+  fallbackPlan:     z.string().min(1).max(300),
+  days:             z.array(AIProgramDaySchema).min(1).max(5),
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Task completion PATCH body
@@ -175,6 +230,8 @@ export type PlannerInputData          = z.infer<typeof PlannerInputSchema>;
 export type RegeneratePlanInputData   = z.infer<typeof RegeneratePlanInputSchema>;
 export type AIPlannerOutputData       = z.infer<typeof AIPlannerOutputSchema>;
 export type AITaskOutputData          = z.infer<typeof AITaskOutputSchema>;
+export type AIProgramDayData          = z.infer<typeof AIProgramDaySchema>;
+export type MultiDayAIPlannerOutput   = z.infer<typeof MultiDayAIPlannerOutputSchema>;
 export type PlannerProfileData        = z.infer<typeof PlannerProfileSchema>;
 export type PlannerConditionData      = z.infer<typeof PlannerConditionSchema>;
 export type PlannerBehaviorData       = z.infer<typeof PlannerBehaviorSchema>;

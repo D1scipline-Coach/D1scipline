@@ -1,14 +1,27 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Notifications from "expo-notifications";
-import React, { useEffect, useMemo, useState } from "react";
+import { LinearGradient } from "expo-linear-gradient";
+import { Ionicons } from "@expo/vector-icons";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import Svg, { Circle, Defs, LinearGradient as SvgLinearGradient, Path, Stop } from "react-native-svg";
 import AuthScreen from "../components/AuthScreen";
+import OnboardingFlow from "../components/onboarding/OnboardingFlow";
+import { type AiraUserProfile, flattenProfileForAPI, computeProfileMeta } from "../shared/types/profile";
+import { generateDailyPlan, type GeneratedDailyPlan } from "../shared/planner/generateDailyPlan";
+import type { AIPlan, TimedTask, TaskKind, TaskPriority, TaskTag, AIWorkoutExercise } from "../shared/types/appTypes";
+import { generateLocalAiraPlan } from "../shared/integration/airaIntegrationBridge";
+import { AiraIntelligenceError } from "../shared/intelligence/utils/AiraIntelligenceError";
 import { getAccessToken, loadSession, signOut as authSignOut, type AuthUser } from "../lib/auth";
 import { loadUserData, saveUserData } from "../lib/db";
 import {
   ActivityIndicator,
   Animated,
+  Easing,
   Alert,
+  Dimensions,
   FlatList,
+  Image,
+  ImageBackground,
   KeyboardAvoidingView,
   Modal,
   Platform,
@@ -22,9 +35,25 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+
 import { API_BASE_URL } from "../constants/api";
 
+// Animated SVG circle — enables animating strokeDashoffset for the progress ring
+const AnimatedCircle = Animated.createAnimatedComponent(Circle);
+
 // ---------- Storage keys ----------
+//
+// Plan storage relationship:
+//   dc:ai_plan       — PRIMARY. AIPlan JSON written by the local Aira bridge on every
+//                      successful plan generation (onboarding or regenerate). This is
+//                      the source of truth on app restart. Preferred over dc:generated_plan.
+//   dc:generated_plan — LEGACY FALLBACK ONLY. Written by the pre-Aira rule-based planner.
+//                      Only read at startup when dc:ai_plan is absent (backward compat
+//                      for devices that ran the app before Phase 7). Never written by
+//                      the Aira path except in the onboarding error fallback.
+//   dc:tasks          — Task list stored independently. Auto-saved by useEffect on every
+//                      task state change. Restored at startup regardless of which plan
+//                      key is present, so task done-states survive app restarts.
 const STORE = {
   profile:        "dc:profile",
   blocks:         "dc:blocks",
@@ -35,6 +64,10 @@ const STORE = {
   recovery:       "dc:recovery",
   history:        "dc:history",
   feedback:       "dc:feedback",
+  patterns:       "dc:patterns",
+  programPlan:    "dc:program_plan",
+  generatedPlan:  "dc:generated_plan", // legacy — see note above
+  aiPlan:         "dc:ai_plan",        // primary Aira plan — see note above
 } as const;
 
 
@@ -49,21 +82,33 @@ const STORE = {
  */
 
 // ---------- Types ----------
-type Profile = {
-  name: string;
-  goal: string;
-  wake: string;
-  sleep: string;
-  startingPoint?:    string;
-  targetGoal?:       string;
-  bodyFatDirection?: "lose_fat" | "maintain" | "build_lean";
-  experienceLevel?:  "beginner" | "intermediate" | "advanced";
-  equipment?:        "none" | "minimal" | "full_gym";
-  workoutFrequency?: "2x" | "3x" | "4x" | "5x";
-  dailyTrainingTime?:"20min" | "30min" | "45min" | "60min";
+// Profile is the canonical nested user profile — see shared/types/profile.ts
+type Profile = AiraUserProfile;
+
+type DayLog     = { date: string; score: number; tasksTotal: number; tasksDone: number; evalStatus?: DayEvalStatus };
+
+// Cumulative behavior patterns — persisted across sessions, updated on every task toggle.
+// kindDone:    completions per category. kindUndone: unchecks per category (skip proxy).
+// workoutSlots: how many workouts completed in each part of the day.
+// Adaptive Day Engine trigger types (defined here so PredictiveInsight can reference them)
+type AdaptTrigger = "less_time" | "missed_workout" | "low_completion" | "low_energy" | "shift_later";
+
+// A single proactive coaching insight — shown before failure happens
+type PredictiveInsight = {
+  key:     string;
+  label:   string;
+  message: string;
+  action?: { label: string; trigger: AdaptTrigger };
 };
 
-type DayLog     = { date: string; score: number; tasksTotal: number; tasksDone: number };
+type BehaviorPatterns = {
+  kindDone:     Partial<Record<TaskKind, number>>;
+  kindUndone:   Partial<Record<TaskKind, number>>;
+  workoutSlots: { morning: number; afternoon: number; evening: number };
+};
+const emptyPatterns = (): BehaviorPatterns => ({
+  kindDone: {}, kindUndone: {}, workoutSlots: { morning: 0, afternoon: 0, evening: 0 },
+});
 type StreakData  = { currentStreak: number; bestStreak: number; lastActiveDate: string };
 type RecoveryData = {
   date:               string;
@@ -86,28 +131,7 @@ type ScheduleBlock = {
   endMin: number;
 };
 
-type TaskKind =
-  | "Workout"
-  | "Nutrition"
-  | "Hydration"
-  | "Mobility"
-  | "Recovery"
-  | "Habit"
-  | "Sleep"
-  | "Walk"   // legacy — kept for persisted task compat
-  | "Meal";  // legacy — kept for persisted task compat
-
-type TaskPriority = "high" | "medium" | "low";
-
-type TimedTask = {
-  id: string;
-  timeMin: number;
-  timeText: string;
-  title: string;
-  kind: TaskKind;
-  done: boolean;
-  priority?: TaskPriority; // optional — old persisted tasks without it default to "medium"
-};
+// TaskKind, TaskPriority, TaskTag, TimedTask — imported from shared/types/appTypes
 
 // Tracks the outcome of each high-priority task for the current day.
 // `completed: true`  = user marked it done.
@@ -123,18 +147,40 @@ type TaskFeedbackEntry = {
 };
 type TaskFeedbackMap = Record<string, TaskFeedbackEntry>;
 
-// AI-generated daily plan metadata. Tasks are stored as TimedTask in the
-// existing `tasks` state so all downstream systems (score, streak, rebalancing)
-// work unchanged.
-type AIPlan = {
-  id:               string;
-  date:             string;   // YYYY-MM-DD
-  summary:          string;
-  coachingNote:     string;
-  disciplineTarget: string;
-  fallbackPlan:     string;
-  generatedAt:      string;   // ISO timestamp
+// Long-term user memory — derived from persisted history + behavior patterns.
+// Computed via useMemo; all inputs are already persisted so no separate storage needed.
+type UserMemory = {
+  preferredWorkoutTime:  "morning" | "afternoon" | "evening" | null;
+  mostSkippedCategory:   TaskKind | null;
+  consistencyScore:      number; // 0–100, rolling 7-day completion %
+  lastMissedWorkoutTime: number | null; // timeMin of today's missed workout task
 };
+
+// AIPlan — imported from shared/types/appTypes
+
+// Multi-day program structure — foundation for Plan first → Adapt daily
+type ProgramDay = {
+  dayIndex: number;    // 0 = day program was generated, 1 = next day, etc.
+  tasks:    TimedTask[];
+};
+
+type ProgramPlan = {
+  generatedDate: string;    // YYYY-MM-DD — anchor date for dayIndex 0
+  days:          ProgramDay[];
+};
+
+// Signals that drive forward adjustments to upcoming program days
+type ProgramSignals = {
+  missedWorkout:           boolean;
+  missedWorkoutTask?:      TimedTask;   // kept for legacy compatibility
+  missedHighPriorityTasks: TimedTask[]; // all missed high-priority tasks (capped at 2 in function)
+  lowEnergy:               boolean;
+  highCompletion:          boolean;
+  recoveryModeTriggered:   boolean;
+  dayMissed:               boolean;     // dayEvaluation.status === "MISS"
+};
+
+// AIWorkoutExercise — imported from shared/types/appTypes
 
 // ---------- Workout session types ----------
 // V1 data structure — ready for planner-linked data when the backend supports it.
@@ -198,7 +244,7 @@ type RecoveryPlan = {
   coachingCue:  string;        // closing directive shown at the bottom
 };
 
-type TabKey = "Today" | "Schedule" | "Chat" | "Progress" | "Settings";
+type TabKey = "Home" | "Coach" | "Progress";
 
 // ---------- Helpers ----------
 function pad2(n: number) {
@@ -255,6 +301,25 @@ function parseTimeToMinutes(input: string): number | null {
   return hour * 60 + m;
 }
 
+/** Strips redundant ":00" from time strings for cleaner display: "7:00 AM" → "7 AM". */
+function formatDisplayTime(t: string): string {
+  return t.replace(/:00 /, " ");
+}
+
+/**
+ * Returns the sleep duration in minutes, correctly handling overnight ranges.
+ * e.g. sleep "11:30 PM" → wake "7:30 AM" = 480 min (not negative).
+ * Adds 1440 to wakeMin when wake <= sleep (crosses midnight).
+ * Returns null if either string fails to parse.
+ */
+function sleepDurationMins(sleepTimeStr: string, wakeTimeStr: string): number | null {
+  const s = parseTimeToMinutes(sleepTimeStr);
+  const w = parseTimeToMinutes(wakeTimeStr);
+  if (s == null || w == null) return null;
+  const adjustedWake = w <= s ? w + 1440 : w;
+  return adjustedWake - s;
+}
+
 function minutesToTimeText(min: number): string {
   const m = ((min % 1440) + 1440) % 1440;
   const hour24 = Math.floor(m / 60);
@@ -263,6 +328,1101 @@ function minutesToTimeText(min: number): string {
   let hour12 = hour24 % 12;
   if (hour12 === 0) hour12 = 12;
   return `${hour12}:${pad2(minute)} ${ampm}`;
+}
+
+/**
+ * Converts the user's saved schedule blocks into a compact context string
+ * that describes busy time and free windows.
+ * Used for: (1) injecting into the AI plan prompt (server-side mirrors this),
+ *           (2) generating the UI feedback note shown after plan generation.
+ */
+/**
+ * Extracts today's tasks from a stored ProgramPlan.
+ * currentDayIndex = days elapsed since programPlan.generatedDate.
+ * Returns [] when the program doesn't cover the requested day yet.
+ */
+function getTodayFromProgram(plan: ProgramPlan, currentDayIndex: number): TimedTask[] {
+  return plan.days.find((d) => d.dayIndex === currentDayIndex)?.tasks ?? [];
+}
+
+/**
+ * Derives the correct program day index for right now.
+ *
+ * Rules:
+ *   Same calendar day as generatedDate  → 0
+ *   Each elapsed calendar day           → +1
+ *   Beyond the last generated day       → clamped to highest available dayIndex
+ *   programPlan is null / empty         → 0 (safe fallback)
+ *
+ * Date arithmetic uses UTC strings to stay consistent with how generatedDate is stored.
+ */
+function getCurrentProgramDayIndex(
+  plan: ProgramPlan | null,
+  now:  Date = new Date(),
+): number {
+  if (!plan || !plan.days.length) return 0;
+
+  // Use UTC date strings for both sides so timezone offsets don't skew the diff
+  const startMs   = new Date(plan.generatedDate).getTime();           // midnight UTC of generation day
+  const todayMs   = new Date(now.toISOString().slice(0, 10)).getTime(); // midnight UTC of today
+  const elapsed   = Math.max(0, Math.round((todayMs - startMs) / 86400000));
+
+  // Clamp: never exceed the highest dayIndex present in the program
+  const maxDayIndex = Math.max(...plan.days.map((d) => d.dayIndex));
+  return Math.min(elapsed, maxDayIndex);
+}
+
+/**
+ * Applies today's outcome signals as forward adjustments to upcoming program days.
+ * Pure function — never mutates past or current day. Returns an updated ProgramPlan.
+ *
+ * Rules (applied in order, each is independent):
+ *   MISSED_WORKOUT   → inject the missed task into the next day if it has no workout yet
+ *   LOW_ENERGY       → mark next-day Workout tasks as "(light)" at medium priority
+ *   HIGH_COMPLETION  → promote up to 2 medium tasks on the next day to high priority
+ *   RECOVERY_MODE    → elevate Mobility/Hydration/Sleep/Recovery, downgrade Workout
+ */
+/**
+ * Applies today's performance signals as forward adjustments to the next program day.
+ * Pure function — never mutates past or current day. Returns a new ProgramPlan.
+ *
+ * Rules applied in order:
+ *   1. CARRYOVER      — inject up to 2 missed high-priority tasks into the next day
+ *   2. LOW ENERGY     — soften Workout tasks on the next day (light label + medium priority)
+ *   3. HIGH COMPLETION — promote up to 2 medium tasks to high (only on a genuinely good day)
+ *   4. RECOVERY MODE  — elevate rest tasks, downgrade Workout
+ *   5. MISS / RESET   — remove low-priority tasks + trim 1 medium to reduce volume
+ *
+ * Framing for rule 5: "reset and refocus" — not punishment.
+ */
+function updateFutureProgramDays(
+  plan:            ProgramPlan,
+  currentDayIndex: number,
+  signals:         ProgramSignals,
+): ProgramPlan {
+  const {
+    missedHighPriorityTasks,
+    lowEnergy,
+    highCompletion,
+    recoveryModeTriggered,
+    dayMissed,
+  } = signals;
+
+  const hasCarryovers = missedHighPriorityTasks.length > 0;
+  const hasAnySignal  = hasCarryovers || lowEnergy || highCompletion || recoveryModeTriggered || dayMissed;
+  if (!hasAnySignal) return plan;
+
+  const nextIndex  = currentDayIndex + 1;
+  const hasNextDay = plan.days.some((d) => d.dayIndex === nextIndex);
+
+  // Enforce max 2 carryovers — avoid overloading the next day
+  const toCarry = missedHighPriorityTasks.slice(0, 2);
+
+  let days = plan.days.map((day): ProgramDay => {
+    if (day.dayIndex <= currentDayIndex) return day; // immutable guard: past + current
+    if (day.dayIndex !== nextIndex)      return day; // only touch the immediate next day
+
+    let tasks = [...day.tasks];
+
+    // 1. CARRYOVER — inject missed high-priority tasks, grouped by kind, no duplicates
+    if (hasCarryovers) {
+      for (const missed of toCarry) {
+        // Skip if an identical task already exists (prevent duplication on re-trigger)
+        const alreadyExists = tasks.some(
+          (t) => t.kind === missed.kind && t.title === missed.title
+        );
+        if (alreadyExists) continue;
+
+        // Workout: never stack two in one day
+        if (missed.kind === "Workout" && tasks.some((t) => t.kind === "Workout")) continue;
+
+        // Prefer inserting after the last task of the same kind for logical grouping
+        const sameKind   = tasks.filter((t) => t.kind === missed.kind);
+        const insertTime = sameKind.length > 0
+          ? Math.max(...sameKind.map((t) => t.timeMin)) + 30
+          : missed.timeMin;
+
+        tasks = [...tasks, { ...missed, timeMin: insertTime, done: false, tag: "carried_over" as TaskTag }]
+          .sort((a, b) => a.timeMin - b.timeMin);
+      }
+    }
+
+    // 2. LOW ENERGY — soften Workout tasks (append "(light)", drop to medium priority)
+    if (lowEnergy) {
+      tasks = tasks.map((t) =>
+        t.kind !== "Workout" ? t : {
+          ...t,
+          title:    t.title.includes("(light)") ? t.title : `${t.title} (light)`,
+          priority: "medium" as TaskPriority,
+        }
+      );
+    }
+
+    // 3. HIGH COMPLETION — promote up to 2 medium tasks to high (good days only)
+    if (highCompletion && !lowEnergy && !recoveryModeTriggered && !dayMissed) {
+      let bumped = 0;
+      tasks = tasks.map((t) => {
+        if (bumped < 2 && (t.priority ?? "medium") === "medium") {
+          bumped++;
+          return { ...t, priority: "high" as TaskPriority, tag: "focus" as TaskTag };
+        }
+        return t;
+      });
+    }
+
+    // 4. RECOVERY MODE — elevate Mobility/Hydration/Sleep/Recovery, downgrade Workout
+    if (recoveryModeTriggered) {
+      tasks = tasks.map((t) => {
+        if (t.kind === "Workout") return { ...t, priority: "low" as TaskPriority };
+        if (
+          t.kind === "Mobility" || t.kind === "Hydration" ||
+          t.kind === "Sleep"    || t.kind === "Recovery"
+        ) return { ...t, priority: "high" as TaskPriority };
+        return t;
+      });
+    }
+
+    // 5. MISS / RESET — remove low-priority tasks + trim 1 medium to reduce volume
+    //    High-priority tasks (including just-carried ones) are never removed.
+    if (dayMissed) {
+      tasks = tasks.filter((t) => (t.priority ?? "medium") !== "low");
+      // Drop the last medium-priority task (reduces volume without gutting the plan)
+      const lastMedIdx = tasks.map((t) => t.priority ?? "medium").lastIndexOf("medium");
+      if (lastMedIdx !== -1) tasks = tasks.filter((_, i) => i !== lastMedIdx);
+    }
+
+    return { ...day, tasks };
+  });
+
+  // CARRYOVER edge case: next day doesn't exist in the program yet — create a stub
+  if (hasCarryovers && !hasNextDay) {
+    const stubTasks = toCarry
+      .filter((missed) => {
+        // Same no-dup / no-stack rules as above, but against an empty day
+        if (missed.kind === "Workout" &&
+            toCarry.filter((t) => t.kind === "Workout").indexOf(missed) > 0) return false;
+        return true;
+      })
+      .map((t) => ({ ...t, done: false, tag: "carried_over" as TaskTag }));
+    if (stubTasks.length) {
+      days = [...days, { dayIndex: nextIndex, tasks: stubTasks }]
+        .sort((a, b) => a.dayIndex - b.dayIndex);
+    }
+  }
+
+  return { ...plan, days };
+}
+
+function getScheduleContext(blocks: ScheduleBlock[]): string {
+  if (!blocks.length) return "";
+
+  const sorted = [...blocks].sort((a, b) => a.startMin - b.startMin);
+
+  function fmtHour(min: number): string {
+    const h = Math.floor(min / 60) % 24;
+    const m = min % 60;
+    const suf = h < 12 ? "AM" : "PM";
+    const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+    return m === 0 ? `${h12}${suf}` : `${h12}:${pad2(m)}${suf}`;
+  }
+
+  const busyParts = sorted.map((b) => `${b.title} (${fmtHour(b.startMin)}–${fmtHour(b.endMin)})`);
+
+  // Detect free gaps anchored to a rough 6AM–10PM day
+  const WAKE = 6 * 60, SLEEP = 22 * 60;
+  const free: string[] = [];
+  if (sorted[0].startMin - WAKE > 30) free.push(`before ${fmtHour(sorted[0].startMin)}`);
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const gap = sorted[i + 1].startMin - sorted[i].endMin;
+    if (gap > 30) free.push(`${fmtHour(sorted[i].endMin)}–${fmtHour(sorted[i + 1].startMin)}`);
+  }
+  const last = sorted[sorted.length - 1];
+  if (SLEEP - last.endMin > 30) free.push(`after ${fmtHour(last.endMin)}`);
+
+  let out = `Busy: ${busyParts.join(", ")}.`;
+  if (free.length) out += ` Free: ${free.join(", ")}.`;
+  return out.slice(0, 200);
+}
+
+/**
+ * Derives a short human-readable note about how the plan was adapted
+ * to the user's schedule. Shown as a subtle line in Today's plan section.
+ */
+function getScheduleNote(blocks: ScheduleBlock[]): string | null {
+  if (!blocks.length) return null;
+
+  const sorted = [...blocks].sort((a, b) => a.startMin - b.startMin);
+  const totalBusy = sorted.reduce((s, b) => s + (b.endMin - b.startMin), 0);
+  const dayLen = 16 * 60; // assume 6AM–10PM window
+  const busyRatio = totalBusy / dayLen;
+
+  if (busyRatio > 0.6) return "Tight schedule — focused plan.";
+
+  // Surface the dominant block type
+  const typeCounts: Partial<Record<string, number>> = {};
+  for (const b of sorted) typeCounts[b.type] = (typeCounts[b.type] ?? 0) + 1;
+  const topType = Object.entries(typeCounts).sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0))[0]?.[0];
+
+  const first = sorted[0];
+  const last  = sorted[sorted.length - 1];
+
+  function fmtHour(min: number): string {
+    const h = Math.floor(min / 60) % 24;
+    const m = min % 60;
+    const suf = h < 12 ? "AM" : "PM";
+    const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+    return m === 0 ? `${h12}${suf}` : `${h12}:${pad2(m)}${suf}`;
+  }
+
+  if (topType === "Work" && sorted.length === 1) {
+    return `Built around your ${fmtHour(first.startMin)}–${fmtHour(last.endMin)} schedule.`;
+  }
+  if (sorted.length === 1) {
+    return `Built around your ${first.title.toLowerCase()} block.`;
+  }
+  return `Built around ${sorted.length} committed block${sorted.length !== 1 ? "s" : ""}.`;
+}
+
+/**
+ * Generates a short, human-readable explanation of why the plan looks the way it does.
+ * Derived entirely from available client-side context — no extra API call.
+ * Returns null when no meaningful explanation exists (section is hidden).
+ *
+ * Priority order:
+ *   1. Game plan mode (Recover / Minimal) — most explanatory
+ *   2. Heavy schedule pressure  (>60% busy)
+ *   3. Workout placement relative to schedule blocks
+ *   4. Moderate schedule — conflict avoidance
+ *   5. Behaviour pattern — workout time preference
+ *   6. Behaviour pattern — previously skipped kind moved earlier
+ */
+function buildPlanRationale(
+  tasks:  TimedTask[],
+  blocks: ScheduleBlock[],
+  gamePlan: GamePlan | null,
+  pi: {
+    preferredWorkoutTime: "morning" | "afternoon" | "evening" | null;
+    mostSkippedKind:      TaskKind | null;
+    hasData:              boolean;
+  }
+): string | null {
+  if (!tasks.length) return null;
+
+  // 1 — Game plan mode overrides everything else
+  if (gamePlan?.readiness === "Recover") {
+    return "Recovery day — rest and repair take priority over intensity.";
+  }
+  if (gamePlan?.timeMode === "Minimal") {
+    return "Minimal mode — one focused task beats a long list left untouched.";
+  }
+
+  const workout   = tasks.find((t) => t.kind === "Workout");
+  const hasBlocks = blocks.length > 0;
+
+  if (hasBlocks) {
+    const totalBusy = blocks.reduce((s, b) => s + (b.endMin - b.startMin), 0);
+    const busyRatio = totalBusy / (16 * 60); // fraction of a 16-hr waking day
+
+    // 2 — Heavy day: plan was compressed
+    if (busyRatio > 0.6) {
+      return "Tight schedule today — the plan keeps only what will actually move the needle.";
+    }
+
+    // 3 — Workout placement driven by which windows are free
+    if (workout) {
+      const wMin              = workout.timeMin;
+      const blocksInMorning   = blocks.some((b) => b.startMin < 12 * 60 && b.endMin > 6 * 60);
+      const blocksInAfternoon = blocks.some((b) => b.startMin < 17 * 60 && b.endMin > 12 * 60);
+
+      if (wMin < 12 * 60 && blocksInAfternoon && !blocksInMorning) {
+        return "Your workout leads the day — afternoon commitments make the morning your strongest window.";
+      }
+      if (wMin < 12 * 60 && !blocksInMorning) {
+        return "Workout placed early while your morning is free — the best window before your schedule fills up.";
+      }
+      if (wMin >= 12 * 60 && wMin < 17 * 60 && blocksInMorning) {
+        return "Workout scheduled after your morning commitments — your first open window of the day.";
+      }
+    }
+
+    // 4 — Moderate schedule: conflict-avoidance explanation
+    if (busyRatio > 0.2) {
+      return "Tasks were slotted into your free windows — nothing conflicts with your commitments.";
+    }
+  }
+
+  // 5 & 6 — Behaviour pattern explanations (only when we have enough data)
+  if (pi.hasData) {
+    if (workout && pi.preferredWorkoutTime) {
+      const wMin = workout.timeMin;
+      const matchesPref =
+        (pi.preferredWorkoutTime === "morning"   && wMin <  12 * 60) ||
+        (pi.preferredWorkoutTime === "afternoon" && wMin >= 12 * 60 && wMin < 17 * 60) ||
+        (pi.preferredWorkoutTime === "evening"   && wMin >= 17 * 60);
+      if (matchesPref) {
+        return `Workout in the ${pi.preferredWorkoutTime} — that's when you're most consistent.`;
+      }
+    }
+
+    if (pi.mostSkippedKind) {
+      const skippedTask = tasks.find((t) => t.kind === pi.mostSkippedKind);
+      if (skippedTask && skippedTask.timeMin < 14 * 60) {
+        return `${pi.mostSkippedKind} is earlier today — you tend to skip it when it's left for later.`;
+      }
+    }
+  }
+
+  return null; // no explanation worth surfacing
+}
+
+// ─── Coach Personality System ────────────────────────────────────────────────
+//
+// Derives the current coaching tone from observable user state.
+// Drives: chat prompt injection, UI labels, auto-pilot banner phrasing.
+// Pure function — no side effects, no React hooks.
+
+type CoachMode = "PUSH" | "BUILD" | "RECOVERY";
+
+const COACH_MODE_META: Record<CoachMode, { label: string; color: string; sub: string }> = {
+  PUSH:     { label: "PUSH MODE",     color: "#FF5252", sub: "Direct · Urgent · Challenging"   },
+  BUILD:    { label: "BUILD MODE",    color: "#6C63FF", sub: "Structured · Focused · Forward"   },
+  RECOVERY: { label: "RECOVERY MODE", color: "#FFB300", sub: "Calm · Simple · Supportive"      },
+};
+
+function getCoachMode(p: {
+  todayDoneCount:      number;
+  rebalancedTaskCount: number;
+  liveStreak:          number;
+  gamePlan:            GamePlan | null;
+  energyLevel:         RecoveryData["energyLevel"];
+  adaptTrigger:        AdaptTrigger | null;
+  hasWorkoutRecovered: boolean;
+  hasMiddayAdjusted:   boolean;
+  hasDayRecovered:     boolean;
+}): CoachMode {
+  const { todayDoneCount, rebalancedTaskCount, liveStreak, gamePlan,
+          energyLevel, adaptTrigger, hasWorkoutRecovered, hasMiddayAdjusted, hasDayRecovered } = p;
+  const nowHour = new Date().getHours();
+
+  // RECOVERY — body/plan signals override everything
+  if (gamePlan?.readiness === "Recover")                         return "RECOVERY";
+  if (energyLevel === "low")                                     return "RECOVERY";
+  if (adaptTrigger === "low_energy" || adaptTrigger === "less_time") return "RECOVERY";
+  if (hasWorkoutRecovered || hasMiddayAdjusted || hasDayRecovered)  return "RECOVERY";
+
+  // PUSH — time pressure or streak at risk
+  const streakAtRisk  = liveStreak > 0 && todayDoneCount === 0 && nowHour >= 12;
+  const runningLate   = todayDoneCount === 0 && nowHour >= 14;
+  const lateAndBehind = nowHour >= 18 && rebalancedTaskCount > 0
+    && todayDoneCount < Math.ceil(rebalancedTaskCount / 2);
+
+  if (streakAtRisk || runningLate || lateAndBehind) return "PUSH";
+
+  return "BUILD";
+}
+
+// Mode-aware auto-pilot banner messages — selected at trigger time based on current mode
+const AUTO_PILOT_BANNERS: Record<
+  "MIDDAY_ADJUST" | "MISSED_WORKOUT_AUTO" | "DAY_RECOVERY",
+  Record<CoachMode, string>
+> = {
+  MIDDAY_ADJUST: {
+    PUSH:     "Running behind — stripped to essentials. Move now.",
+    BUILD:    "Plan adjusted to keep you on track.",
+    RECOVERY: "We're adjusting — still time for a solid win.",
+  },
+  MISSED_WORKOUT_AUTO: {
+    PUSH:     "Workout window passed. Re-prioritized — get it done now.",
+    BUILD:    "Workout moved — still time to get it done.",
+    RECOVERY: "Workout re-slotted — a short session still counts.",
+  },
+  DAY_RECOVERY: {
+    PUSH:     "Evening sprint — essentials only. Execute.",
+    BUILD:    "Refocusing your day.",
+    RECOVERY: "Simplified for the evening — let's finish clean.",
+  },
+};
+
+// ─── AI Command System ────────────────────────────────────────────────────────
+//
+// Keyword-based intent detection — no NLP, no dependencies.
+// Returns a structured command when the user's chat message signals a plan action.
+// Runs client-side before the AI request so the plan updates feel instant.
+
+type CommandType = "LESS_TIME" | "MISSED_WORKOUT" | "LOW_ENERGY" | "SHIFT_LATER" | "LOCK_PLAN";
+type Command = { type: CommandType } | null;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Next Best Action — real-time decision engine
+// ─────────────────────────────────────────────────────────────────────────────
+
+type NextAction = {
+  label:   string;
+  taskId?: string;
+  reason:  string;
+};
+
+function getNextBestAction(p: {
+  tasks:     TimedTask[];
+  coachMode: CoachMode;
+  nowMin:    number;
+}): NextAction | null {
+  const { tasks, coachMode, nowMin } = p;
+  const undone = tasks.filter((t) => !t.done);
+  if (!undone.length) return null;
+
+  const doneCount  = tasks.length - undone.length;
+  const totalCount = tasks.length;
+
+  // 1. Nothing done yet — return first high-priority task
+  if (doneCount === 0) {
+    const first = undone.find((t) => (t.priority ?? "medium") === "high") ?? undone[0];
+    return { label: first.title, taskId: first.id, reason: "Start your day — momentum matters." };
+  }
+
+  // 2. Workout not done and the window is still open (within the next 3 hours)
+  const workout = undone.find((t) => t.kind === "Workout");
+  if (workout && workout.timeMin <= nowMin + 3 * 60) {
+    return { label: workout.title, taskId: workout.id, reason: "Best time to train based on your schedule." };
+  }
+
+  // 3. Behind schedule: < 40% complete and past noon
+  const completionPct = totalCount > 0 ? doneCount / totalCount : 0;
+  if (completionPct < 0.4 && nowMin >= 12 * 60) {
+    const highImpact = undone.find((t) => (t.priority ?? "medium") === "high") ?? undone[0];
+    return { label: highImpact.title, taskId: highImpact.id, reason: "Let's secure a win and build momentum." };
+  }
+
+  // 4. Recovery mode — return the easiest meaningful task
+  if (coachMode === "RECOVERY") {
+    const kindOrder: Partial<Record<TaskKind, number>> = {
+      Mobility: 0, Hydration: 1, Recovery: 2, Habit: 3, Nutrition: 4, Sleep: 5, Workout: 6,
+    };
+    const easiest = [...undone].sort(
+      (a, b) => (kindOrder[a.kind] ?? 9) - (kindOrder[b.kind] ?? 9)
+    )[0];
+    return { label: easiest.title, taskId: easiest.id, reason: "Keep it light — stay consistent." };
+  }
+
+  // 5. Next chronological high-priority task
+  const nextHigh = undone
+    .filter((t) => (t.priority ?? "medium") === "high")
+    .sort((a, b) => a.timeMin - b.timeMin)[0];
+  const next = nextHigh ?? [...undone].sort((a, b) => a.timeMin - b.timeMin)[0];
+  return { label: next.title, taskId: next.id, reason: "Your next priority — keep the momentum going." };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Win Condition — daily success framework
+// ─────────────────────────────────────────────────────────────────────────────
+
+type WinCondition = {
+  primary:    string;
+  secondary?: string;
+  flex?:      string[];
+};
+
+function getWinCondition(p: {
+  tasks:       TimedTask[];
+  coachMode:   CoachMode;
+  gamePlan:    GamePlan | null;
+  adaptTrigger: AdaptTrigger | null;
+}): WinCondition | null {
+  const { tasks, coachMode, gamePlan, adaptTrigger } = p;
+  if (!tasks.length) return null;
+
+  const undone   = tasks.filter((t) => !t.done);
+  const highUndone = undone.filter((t) => (t.priority ?? "medium") === "high");
+  const isCompressed = adaptTrigger === "less_time" || gamePlan?.timeMode === "Minimal"
+    || adaptTrigger === "low_energy";
+  const isTight  = gamePlan?.timeMode === "Condensed" || adaptTrigger === "shift_later";
+
+  // Recovery mode — single achievable outcome
+  if (coachMode === "RECOVERY" || gamePlan?.readiness === "Recover") {
+    const mobility  = undone.find((t) => t.kind === "Mobility"  && !t.done);
+    const hydration = undone.find((t) => t.kind === "Hydration" && !t.done);
+    const primary = mobility?.title ?? hydration?.title ?? "Complete one recovery task";
+    return { primary };
+  }
+
+  // Plan compressed (minimal/less_time) — one thing only
+  if (isCompressed) {
+    const workout   = undone.find((t) => t.kind === "Workout");
+    const topHigh   = highUndone[0];
+    const primary   = workout?.title ?? topHigh?.title ?? undone[0]?.title ?? "One thing done";
+    return { primary };
+  }
+
+  // Workout is high priority and undone — anchor the day around it
+  const workoutHigh = highUndone.find((t) => t.kind === "Workout");
+  if (workoutHigh) {
+    const second = highUndone.find((t) => t.id !== workoutHigh.id && t.kind !== "Workout");
+    const flexItems = isTight ? [] : undone
+      .filter((t) => (t.priority ?? "medium") !== "high" && t.id !== workoutHigh.id)
+      .slice(0, 2)
+      .map((t) => t.title);
+    return {
+      primary:   workoutHigh.title,
+      ...(second    ? { secondary: second.title } : {}),
+      ...(flexItems.length ? { flex: flexItems } : {}),
+    };
+  }
+
+  // No workout anchor — use top two high-priority tasks
+  if (highUndone.length >= 2) {
+    const flexItems = isTight ? [] : undone
+      .filter((t) => (t.priority ?? "medium") !== "high")
+      .slice(0, 2)
+      .map((t) => t.title);
+    return {
+      primary:   highUndone[0].title,
+      secondary: highUndone[1].title,
+      ...(flexItems.length ? { flex: flexItems } : {}),
+    };
+  }
+
+  if (highUndone.length === 1) {
+    const flexItems = undone
+      .filter((t) => (t.priority ?? "medium") !== "high")
+      .slice(0, 2)
+      .map((t) => t.title);
+    return {
+      primary: highUndone[0].title,
+      ...(flexItems.length ? { flex: flexItems } : {}),
+    };
+  }
+
+  // All tasks are medium/low — just take the first chronological one
+  if (undone.length > 0) {
+    return { primary: undone[0].title };
+  }
+
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Day Evaluation — end-of-day accountability
+// ─────────────────────────────────────────────────────────────────────────────
+
+type DayEvalStatus = "WIN" | "PARTIAL" | "MISS";
+
+type DayEvaluation = {
+  status:          DayEvalStatus;
+  message:         string;
+  focusTomorrow?:  string;
+};
+
+function evaluateDay(p: {
+  tasks:             TimedTask[];
+  winCondition:      WinCondition | null;
+  consistencyScore:  number;
+  coachMode:         CoachMode;
+}): DayEvaluation {
+  const { tasks, winCondition, consistencyScore, coachMode } = p;
+
+  const totalCount = tasks.length;
+  const doneCount  = tasks.filter((t) => t.done).length;
+  const pct        = totalCount > 0 ? doneCount / totalCount : 0;
+
+  // Determine primary completion
+  const primaryTask = winCondition?.primary
+    ? tasks.find((t) => t.title === winCondition.primary)
+    : null;
+  const primaryDone = primaryTask ? primaryTask.done : pct >= 0.8;
+
+  // Determine secondary completion
+  const secondaryTask = winCondition?.secondary
+    ? tasks.find((t) => t.title === winCondition.secondary)
+    : null;
+  const secondaryDone = secondaryTask ? secondaryTask.done : pct >= 0.5;
+
+  // Identify the most impactful undone category for tomorrow focus
+  const missedHighTasks = tasks.filter(
+    (t) => !t.done && (t.priority ?? "medium") === "high"
+  );
+  const missedKind = missedHighTasks[0]?.kind ?? null;
+  const focusTomorrow = missedKind
+    ? missedKind === "Workout"   ? "Get your workout done early — don't let it slip again."
+    : missedKind === "Nutrition" ? "Simplify nutrition — one solid meal is enough to start."
+    : missedKind === "Habit"     ? "Lock in your habit first thing tomorrow."
+    : missedKind === "Sleep"     ? "Prioritise sleep prep — it sets the next day's tone."
+    : `Finish your ${missedKind.toLowerCase()} task earlier tomorrow.`
+    : undefined;
+
+  // Tone variants per coach mode
+  const winMsg: Record<CoachMode, string> = {
+    PUSH:     "Strong day. You handled what mattered — don't lose that edge.",
+    BUILD:    "Strong day. You handled what mattered.",
+    RECOVERY: "Good day. You kept it going — consistency is the whole game.",
+  };
+  const partialMsg: Record<CoachMode, string> = {
+    PUSH:     "Not enough. Solid effort, but tighten execution tomorrow — primary must happen.",
+    BUILD:    "Solid effort. Let's tighten execution tomorrow.",
+    RECOVERY: "Decent day. One thing at a time — let's close the gap tomorrow.",
+  };
+  const missMsg: Record<CoachMode, string> = {
+    PUSH:     "We missed today. That's not acceptable. Reset hard and come back stronger.",
+    BUILD:    "We missed today. Reset and come back stronger.",
+    RECOVERY: "Today didn't go to plan. That's okay — reset tomorrow and make one thing happen.",
+  };
+
+  if (primaryDone) {
+    return { status: "WIN", message: winMsg[coachMode] };
+  }
+
+  if (secondaryDone || pct >= 0.4) {
+    return {
+      status:  "PARTIAL",
+      message: partialMsg[coachMode],
+      ...(focusTomorrow ? { focusTomorrow } : {}),
+    };
+  }
+
+  return {
+    status:  "MISS",
+    message: missMsg[coachMode],
+    ...(focusTomorrow ? { focusTomorrow } : {}),
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Readiness Check — start-of-day input interpretation
+// ─────────────────────────────────────────────────────────────────────────────
+
+type ReadinessLevel = "RECOVER" | "BUILD" | "PUSH";
+
+type ReadinessState = {
+  readiness: ReadinessLevel;
+  reason:    string;
+};
+
+/**
+ * Derive a ReadinessState from the already-computed gamePlan + energyState.
+ * Delegates the heavy mapping to generateGamePlan (single source of truth);
+ * this function only adds the human-readable reason string.
+ */
+function getReadinessState(p: {
+  gamePlan:    GamePlan | null;
+  energyState: EnergyState;
+  energyLevel: RecoveryData["energyLevel"];
+  soreness:    RecoveryData["soreness"];
+}): ReadinessState | null {
+  const { gamePlan, energyState, energyLevel, soreness } = p;
+
+  // No check-in yet — nothing to show
+  if (!gamePlan && energyLevel === null) return null;
+
+  // Map gamePlan.readiness → ReadinessLevel (gamePlan is authoritative post check-in)
+  if (gamePlan) {
+    const level: ReadinessLevel =
+      gamePlan.readiness === "Push"    ? "PUSH"    :
+      gamePlan.readiness === "Recover" ? "RECOVER" :
+      "BUILD";
+
+    const reason =
+      level === "PUSH"
+        ? "Strong energy and readiness — press your advantage today."
+        : level === "RECOVER"
+        ? soreness === "sore"
+          ? "Body is flagging soreness — simplify and protect recovery."
+          : energyLevel === "low"
+          ? "Low energy — stay consistent, keep it light."
+          : "Schedule or readiness signals a recovery-focused day."
+        : energyState === "MEDIUM"
+        ? "Solid baseline — stack a disciplined, structured day."
+        : "Good readiness — execute the plan and build momentum.";
+
+    return { readiness: level, reason };
+  }
+
+  // Pre check-in: fall back to energy state alone (rare path)
+  const level: ReadinessLevel =
+    energyState === "HIGH" ? "PUSH"    :
+    energyState === "LOW"  ? "RECOVER" :
+    "BUILD";
+
+  const reason =
+    level === "PUSH"    ? "High energy detected — lead with your hardest task." :
+    level === "RECOVER" ? "Low energy signals a recovery-focused approach."      :
+                          "Moderate readiness — execute steadily.";
+
+  return { readiness: level, reason };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Energy-Aware Planning — state-based plan adaptation
+// ─────────────────────────────────────────────────────────────────────────────
+
+type EnergyState = "HIGH" | "MEDIUM" | "LOW";
+
+type EnergyAdaptation = {
+  modifiedTasks: TimedTask[];
+  message?:      string;
+};
+
+/**
+ * Derive a three-tier energy state from check-in signals + recent behaviour.
+ * Falls back to MEDIUM when no data exists so the default experience is neutral.
+ */
+function deriveEnergyState(p: {
+  energyLevel:      RecoveryData["energyLevel"];
+  soreness:         RecoveryData["soreness"];
+  motivationLevel:  RecoveryData["motivationLevel"];
+  recentMissCount:  number;   // misses in last 3 days (from history)
+  adaptTrigger:     AdaptTrigger | null;
+}): EnergyState {
+  const { energyLevel, soreness, motivationLevel, recentMissCount, adaptTrigger } = p;
+
+  // Explicit LOW signals win immediately
+  if (
+    energyLevel === "low" ||
+    soreness === "sore" ||
+    adaptTrigger === "low_energy" ||
+    (motivationLevel === "low" && energyLevel !== "high")
+  ) return "LOW";
+
+  // Recent behaviour drags toward LOW even without check-in data
+  if (recentMissCount >= 2 && energyLevel !== "high") return "LOW";
+
+  // HIGH: explicitly stated + adequate motivation
+  // (soreness === "sore" already returned LOW above, so no need to recheck)
+  if (energyLevel === "high" && motivationLevel !== "low") return "HIGH";
+
+  return "MEDIUM";
+}
+
+/**
+ * Apply energy-state rules to the current task list.
+ * Delegates actual mutations to the existing adaptTodayPlan engine where possible
+ * (avoids duplicating sorting / priority logic).
+ */
+function adaptPlanToEnergy(
+  tasks:       TimedTask[],
+  energyState: EnergyState
+): EnergyAdaptation {
+  if (energyState === "HIGH") {
+    // Front-load the hardest task (highest-priority, highest effort kind)
+    const kindWeight: Partial<Record<TaskKind, number>> = {
+      Workout: 0, Mobility: 1, Habit: 2,
+      Nutrition: 3, Hydration: 4, Recovery: 5, Sleep: 6,
+    };
+    const reordered = [...tasks].sort((a, b) => {
+      const pa = (a.priority ?? "medium") === "high" ? 0 : (a.priority ?? "medium") === "medium" ? 1 : 2;
+      const pb = (b.priority ?? "medium") === "high" ? 0 : (b.priority ?? "medium") === "medium" ? 1 : 2;
+      if (pa !== pb) return pa - pb;
+      return (kindWeight[a.kind] ?? 9) - (kindWeight[b.kind] ?? 9);
+    });
+    return {
+      modifiedTasks: reordered,
+      message: "High energy — hardest tasks front-loaded. Go get it.",
+    };
+  }
+
+  if (energyState === "LOW") {
+    // Reuse the existing low_energy adaptation (de-intensify + strip non-essentials)
+    const result = adaptTodayPlan(tasks, "low_energy");
+    return { modifiedTasks: result.tasks, message: result.message };
+  }
+
+  // MEDIUM — standard order, no changes
+  return { modifiedTasks: tasks };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Save The Day — streak protection + active intervention
+// ─────────────────────────────────────────────────────────────────────────────
+
+type SaveTheDay = {
+  trigger: boolean;
+  action:  string;
+  reason:  string;
+  taskId?: string;  // the one task to surface
+};
+
+function getSaveTheDayAction(p: {
+  tasks:         TimedTask[];
+  nowMin:        number;
+  liveStreak:    number;
+  todayDoneCount: number;
+  planLocked:    boolean;
+  dismissed:     boolean;
+}): SaveTheDay {
+  const { tasks, nowMin, liveStreak, todayDoneCount, planLocked, dismissed } = p;
+  const NO_TRIGGER: SaveTheDay = { trigger: false, action: "", reason: "" };
+  if (planLocked || dismissed || !tasks.length) return NO_TRIGGER;
+
+  const nowHour = nowMin / 60;
+  const undone  = tasks.filter((t) => !t.done);
+  const doneCount = tasks.length - undone.length;
+  const completionPct = tasks.length > 0 ? doneCount / tasks.length : 0;
+
+  // Determine which condition fires (evaluated in priority order)
+  const middayInactive  = nowHour >= 13 && todayDoneCount === 0;
+  const lateDayRisk     = nowHour >= 18 && completionPct < 0.4 && tasks.length > 0;
+  const streakAtRisk    = liveStreak > 0 && todayDoneCount === 0;
+
+  if (!middayInactive && !lateDayRisk && !streakAtRisk) return NO_TRIGGER;
+
+  // Pick the single best task to rescue the day
+  // Priority: smallest high-priority task → any high-priority → first undone
+  const highUndone = undone.filter((t) => (t.priority ?? "medium") === "high");
+
+  // "Smallest" = quickest kind (Hydration/Mobility before Workout)
+  const kindWeight: Partial<Record<TaskKind, number>> = {
+    Hydration: 1, Mobility: 2, Habit: 3, Recovery: 4,
+    Nutrition: 5, Sleep: 6, Workout: 7,
+  };
+  const sortedHigh = [...highUndone].sort(
+    (a, b) => (kindWeight[a.kind] ?? 8) - (kindWeight[b.kind] ?? 8)
+  );
+  const pick = sortedHigh[0] ?? undone[0];
+  if (!pick) return NO_TRIGGER;
+
+  // Generate a concrete, short action directive
+  const actionMap: Partial<Record<TaskKind, string>> = {
+    Workout:   "20-minute workout — no excuses, just start.",
+    Nutrition: "One solid meal — prep it right now.",
+    Hydration: "Drink a full bottle of water — takes 60 seconds.",
+    Mobility:  "10 minutes of mobility — floor stretches count.",
+    Habit:     `Complete "${pick.title}" — it takes less time than you think.`,
+    Sleep:     "Start your wind-down — everything else can wait.",
+    Recovery:  "One recovery task — protect your body for tomorrow.",
+  };
+  const action = actionMap[pick.kind] ?? `Complete "${pick.title}" right now.`;
+
+  // Reason driven by which condition fired
+  const reason = streakAtRisk && liveStreak > 1
+    ? `Your ${liveStreak}-day streak is on the line — one task saves it.`
+    : middayInactive
+    ? "It's after 1 PM and nothing's done. One task changes everything."
+    : "Less than 40% done and the evening is here. Secure this win.";
+
+  return { trigger: true, action, reason, taskId: pick.id };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Weekly Momentum — multi-day progress signal
+// ─────────────────────────────────────────────────────────────────────────────
+
+type WeeklyMomentumStatus = "STRONG" | "BUILDING" | "SLIPPING";
+
+type WeeklyMomentum = {
+  status:  WeeklyMomentumStatus;
+  summary: string;
+  focus:   string;
+};
+
+function getWeeklyMomentum(p: {
+  history:          DayLog[];       // last 30 days — filtered to last 7 here
+  consistencyScore: number;         // 0-100, 7-day rolling average
+  currentStreak:    number;
+}): WeeklyMomentum | null {
+  const { history, consistencyScore, currentStreak } = p;
+
+  const todayStr = new Date().toISOString().slice(0, 10);
+  // Build a view of the last 7 days, newest last
+  const last7: DayLog[] = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    const dateStr = d.toISOString().slice(0, 10);
+    const entry = history.find((h) => h.date === dateStr);
+    if (entry) last7.push(entry);
+  }
+
+  // Need at least 2 data points to say anything meaningful
+  if (last7.length < 2) return null;
+
+  // Tally eval results from stored evalStatus; fall back to score when absent
+  const wins    = last7.filter((d) => d.evalStatus === "WIN"     || (!d.evalStatus && d.score >= 80)).length;
+  const partials = last7.filter((d) => d.evalStatus === "PARTIAL" || (!d.evalStatus && d.score >= 40 && d.score < 80)).length;
+  const misses  = last7.filter((d) => d.evalStatus === "MISS"    || (!d.evalStatus && d.score > 0 && d.score < 40)).length;
+  const active  = last7.filter((d) => d.score > 0).length;
+
+  // Recency bias: look at just the last 3 days for trend direction
+  const recent3 = last7.slice(-3);
+  const recentWins   = recent3.filter((d) => d.evalStatus === "WIN"  || (!d.evalStatus && d.score >= 80)).length;
+  const recentMisses = recent3.filter((d) => d.evalStatus === "MISS" || (!d.evalStatus && d.score > 0 && d.score < 40)).length;
+
+  // ── STRONG: multiple wins, rising trend, solid streak, high consistency ───
+  const isStrong = (
+    wins >= 3 &&
+    recentWins >= 2 &&
+    consistencyScore >= 65 &&
+    currentStreak >= 3
+  );
+
+  // ── SLIPPING: repeated misses or low consistency with no upward trend ─────
+  const isSlipping = (
+    misses >= 2 &&
+    recentMisses >= 1 &&
+    consistencyScore < 50
+  ) || (
+    active >= 3 &&
+    wins === 0 &&
+    consistencyScore < 40
+  );
+
+  // Descriptive components
+  const streakNote = currentStreak >= 5
+    ? `${currentStreak}-day streak on the line.`
+    : currentStreak >= 2
+    ? `${currentStreak} days in a row.`
+    : "";
+
+  if (isStrong) {
+    return {
+      status:  "STRONG",
+      summary: wins >= 5
+        ? `${wins} wins this week — this is what consistency looks like.`
+        : `${wins} strong day${wins !== 1 ? "s" : ""} this week${streakNote ? " · " + streakNote : ""} Keep building.`,
+      focus: "Protect your standard — one disciplined day at a time.",
+    };
+  }
+
+  if (isSlipping) {
+    const slipNote = misses >= 3
+      ? `${misses} missed day${misses !== 1 ? "s" : ""} this week.`
+      : "Momentum is dropping.";
+    return {
+      status:  "SLIPPING",
+      summary: `${slipNote} Consistency score: ${consistencyScore}%.`,
+      focus:   "Simplify — secure one clear win and rebuild from there.",
+    };
+  }
+
+  // ── BUILDING: the default middle state ────────────────────────────────────
+  const buildNote = wins > 0
+    ? `${wins} win${wins !== 1 ? "s" : ""} so far this week.`
+    : partials > 0
+    ? `${partials} partial day${partials !== 1 ? "s" : ""} — effort is there.`
+    : "You're showing up.";
+  return {
+    status:  "BUILDING",
+    summary: `${buildNote} ${consistencyScore > 0 ? `Consistency: ${consistencyScore}%.` : ""}`.trim(),
+    focus:   recentMisses >= 1
+      ? "Don't let two misses become three — win tomorrow."
+      : "Momentum is building — protect it with a strong tomorrow.",
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tomorrow Prep — next-day continuity from today's evaluation
+// ─────────────────────────────────────────────────────────────────────────────
+
+type TomorrowPrep = {
+  primaryFocus:      string;
+  prepAction?:       string;
+  carryOverReason?:  string;
+};
+
+// Lightweight prep actions per task kind
+const PREP_ACTIONS: Partial<Record<TaskKind, string>> = {
+  Workout:   "Lay out your gym clothes tonight.",
+  Nutrition: "Prep a protein source or plan your first meal now.",
+  Hydration: "Fill your water bottle and leave it visible.",
+  Mobility:  "Set a 10-minute block in the morning for mobility.",
+  Habit:     "Stack your habit onto an existing morning routine.",
+  Sleep:     "Set a wind-down alarm 30 minutes before your target sleep time.",
+  Recovery:  "Plan one recovery activity — even 10 minutes counts.",
+};
+
+function getTomorrowPrep(p: {
+  dayEvaluation:     DayEvaluation | null;
+  tasks:             TimedTask[];
+  coachMode:         CoachMode;
+  consistencyScore:  number;
+}): TomorrowPrep | null {
+  const { dayEvaluation, tasks, coachMode, consistencyScore } = p;
+  if (!dayEvaluation) return null;
+
+  const { status } = dayEvaluation;
+
+  // Highest-priority missed task drives the primary focus
+  const missedHigh = tasks
+    .filter((t) => !t.done && (t.priority ?? "medium") === "high")
+    .sort((a, b) => a.timeMin - b.timeMin);
+
+  // ── WIN — reinforce momentum, don't reset ─────────────────────────────────
+  if (status === "WIN") {
+    const nextHighKind = missedHigh[0]?.kind ?? null;
+    if (nextHighKind) {
+      return {
+        primaryFocus:     `Keep the momentum — lead with ${nextHighKind.toLowerCase()} again.`,
+        prepAction:       PREP_ACTIONS[nextHighKind],
+        carryOverReason:  "You built real momentum today — don't let it go cold.",
+      };
+    }
+    return {
+      primaryFocus:    coachMode === "PUSH"
+        ? "Push the standard higher tomorrow."
+        : "Repeat today's execution — consistency compounds.",
+      carryOverReason: "A strong day is the best foundation for the next.",
+    };
+  }
+
+  // ── PARTIAL — tighten the one thing that slipped ──────────────────────────
+  if (status === "PARTIAL") {
+    const missed = missedHigh[0];
+    if (missed) {
+      const focus = missed.kind === "Workout"
+        ? "Schedule your workout in your first available free window."
+        : missed.kind === "Nutrition"
+        ? "Simplify nutrition — one clean meal, done early."
+        : missed.kind === "Habit"
+        ? "Do your habit task first, before anything else."
+        : `Complete your ${missed.kind.toLowerCase()} task before midday.`;
+      return {
+        primaryFocus:    focus,
+        prepAction:      PREP_ACTIONS[missed.kind],
+        carryOverReason: `You completed most of today — ${missed.kind.toLowerCase()} was the gap.`,
+      };
+    }
+    return {
+      primaryFocus:    "Tighten execution — close the gap between planned and done.",
+      carryOverReason: "Good effort today, but there's more on the table.",
+    };
+  }
+
+  // ── MISS — simplify and rebuild ───────────────────────────────────────────
+  const missed = missedHigh[0];
+  const isLowConsistency = consistencyScore > 0 && consistencyScore < 50;
+
+  if (missed) {
+    const focus = missed.kind === "Workout"
+      ? "One workout, done early — that's the whole win condition."
+      : missed.kind === "Nutrition"
+      ? "One solid meal. That's it. Start there."
+      : `One ${missed.kind.toLowerCase()} task. Make it non-negotiable.`;
+    const reason = isLowConsistency
+      ? "Consistency is the gap — make tomorrow simpler, not bigger."
+      : "Today didn't land. Rebuild with one clear win.";
+    return {
+      primaryFocus:    focus,
+      prepAction:      PREP_ACTIONS[missed.kind],
+      carryOverReason: reason,
+    };
+  }
+
+  return {
+    primaryFocus:    "Start tomorrow with one clear action — don't overthink it.",
+    carryOverReason: "Reset tonight. One win tomorrow is enough.",
+  };
+}
+
+function detectCommand(input: string): Command {
+  const s = input.toLowerCase();
+  if (/less time|short on time|only have \d+ min|not much time|tight on time|quick session/.test(s))
+    return { type: "LESS_TIME" };
+  if (/missed.*workout|miss.*workout|didn.?t.*train|skipped.*workout|skip.*gym|no workout/.test(s))
+    return { type: "MISSED_WORKOUT" };
+  if (/\btired\b|exhausted|low energy|no energy|drained|wiped out|feel rough|not feeling it/.test(s))
+    return { type: "LOW_ENERGY" };
+  if (/push.*(later|back|evening)|move.*(later|evening|night)|shift.*(later|back|plan)|everything later/.test(s))
+    return { type: "SHIFT_LATER" };
+  if (/lock.*(it|plan|this).*in|this works|looks good.*plan|keep this plan|stick with this/.test(s))
+    return { type: "LOCK_PLAN" };
+  return null;
 }
 
 function overlapsBlock(t: number, block: ScheduleBlock): boolean {
@@ -290,11 +1450,11 @@ function buildTodaysPlan(params: {
 }): TimedTask[] {
   const { wakeMin, sleepMin, blocks, profile } = params;
   const dayLen = sleepMin - wakeMin;
-  const tg  = profile?.targetGoal       ?? "";
-  const bfd = profile?.bodyFatDirection ?? "";
-  const exp = profile?.experienceLevel  ?? "";
-  const eq  = profile?.equipment        ?? "";
-  const dur = profile?.dailyTrainingTime ?? "";
+  const tg  = profile?.derived?.targetGoal       ?? "";
+  const bfd = profile?.derived?.bodyFatDirection ?? "";
+  const exp = profile?.training?.experience      ?? "";
+  const eq  = profile?.derived?.equipment        ?? "";
+  const dur = profile?.training?.sessionDuration  ?? "";
 
   // Experience-aware prefix
   const expPrefix =
@@ -432,11 +1592,216 @@ function calcScore(tasks: TimedTask[]): number {
   return Math.min(pts, SCORE_POINTS.cap);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Profile normalization
+//
+// Any profile loaded from AsyncStorage must pass through here before being
+// used in plan generation. Two failure modes:
+//
+//   1. Old flat shape — profile stored before the nested AiraUserProfile type
+//      was introduced. May have `name`/`firstName` at root, `profile.profile`
+//      sub-object missing entirely.
+//
+//   2. Partial nested shape — profile stored mid-migration or with a required
+//      sub-object undefined (e.g. `derived`, `meta`).
+//
+// Strategy: detect shape, fill every sub-object with safe fallbacks, require
+// sleep.wakeTime + sleep.sleepTime (needed to anchor the schedule). If those
+// are absent the function returns null and callers skip plan generation.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function normalizeProfileForPlanning(raw: unknown): AiraUserProfile | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+
+  // Helper: safely extract an object sub-block
+  function sub(key: string): Record<string, unknown> {
+    const v = r[key];
+    return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
+  }
+
+  // ── Identity ──────────────────────────────────────────────────────────────
+  // New shape: r.profile.firstName
+  // Old shape: r.firstName or r.name at root
+  const profileBlock = sub("profile");
+  const firstName =
+    (profileBlock.firstName as string | undefined) ||
+    (r.firstName as string | undefined) ||
+    (r.name      as string | undefined) ||
+    "";
+
+  // ── Sleep — required to anchor the schedule ───────────────────────────────
+  const sleepBlock = sub("sleep");
+  const wakeTime  = (sleepBlock.wakeTime  as string | undefined) || "";
+  const sleepTime = (sleepBlock.sleepTime as string | undefined) || "";
+
+  if (!wakeTime || !sleepTime) {
+    // Without wake/sleep times we cannot build a scheduled plan — skip silently.
+    return null;
+  }
+
+  // ── Optional sub-blocks ───────────────────────────────────────────────────
+  const goalsBlock     = sub("goals");
+  const trainingBlock  = sub("training");
+  const nutritionBlock = sub("nutrition");
+  const recoveryBlock  = sub("recovery");
+  const scheduleBlock  = sub("schedule");
+  const derivedBlock   = sub("derived");
+  const metaBlock      = sub("meta");
+  const futureBlock    = sub("future");
+
+  return {
+    profile: {
+      firstName,
+      age:    profileBlock.age    as string | undefined,
+      gender: profileBlock.gender as AiraUserProfile["profile"]["gender"],
+      height: profileBlock.height as string | undefined,
+      weight: profileBlock.weight as string | undefined,
+    },
+    goals: {
+      primaryGoal: (goalsBlock.primaryGoal as AiraUserProfile["goals"]["primaryGoal"]) ?? "stay_consistent",
+      goalLabel:   (goalsBlock.goalLabel   as string) ?? "Stay consistent",
+      urgency:     goalsBlock.urgency  as AiraUserProfile["goals"]["urgency"],
+      notes:       goalsBlock.notes    as string | undefined,
+    },
+    training: {
+      gymAccess:       (trainingBlock.gymAccess       as AiraUserProfile["training"]["gymAccess"])       ?? "bodyweight_only",
+      trainingStyle:   (trainingBlock.trainingStyle   as AiraUserProfile["training"]["trainingStyle"])   ?? "general_fitness",
+      experience:      (trainingBlock.experience      as AiraUserProfile["training"]["experience"])      ?? "beginner",
+      daysPerWeek:     (trainingBlock.daysPerWeek     as number)                                         ?? 3,
+      sessionDuration: (trainingBlock.sessionDuration as AiraUserProfile["training"]["sessionDuration"]) ?? "30min",
+      injuries:        trainingBlock.injuries as string | undefined,
+    },
+    nutrition: {
+      dietaryStyle:  (nutritionBlock.dietaryStyle  as AiraUserProfile["nutrition"]["dietaryStyle"])  ?? "everything",
+      nutritionGoal: (nutritionBlock.nutritionGoal as AiraUserProfile["nutrition"]["nutritionGoal"]) ?? "maintenance",
+      mealPrepLevel: (nutritionBlock.mealPrepLevel as AiraUserProfile["nutrition"]["mealPrepLevel"]) ?? "minimal",
+      // Added in onboarding v2 — default to [] for backward-compat with pre-allergy stored profiles
+      allergies:     Array.isArray(nutritionBlock.allergies) ? (nutritionBlock.allergies as string[]) : [],
+      allergyNotes:  nutritionBlock.allergyNotes as string | undefined,
+    },
+    recovery: {
+      sleepQuality:   (recoveryBlock.sleepQuality   as AiraUserProfile["recovery"]["sleepQuality"])   ?? "fair",
+      stressLevel:    (recoveryBlock.stressLevel    as AiraUserProfile["recovery"]["stressLevel"])    ?? "moderate",
+      energyBaseline: (recoveryBlock.energyBaseline as AiraUserProfile["recovery"]["energyBaseline"]) ?? "moderate",
+    },
+    sleep: { wakeTime, sleepTime },
+    schedule: {
+      preferredWorkoutTime: scheduleBlock.preferredWorkoutTime as AiraUserProfile["schedule"]["preferredWorkoutTime"],
+      scheduleConsistency:  scheduleBlock.scheduleConsistency  as AiraUserProfile["schedule"]["scheduleConsistency"],
+    },
+    derived: {
+      equipment:        (derivedBlock.equipment        as AiraUserProfile["derived"]["equipment"])        ?? "none",
+      bodyFatDirection: (derivedBlock.bodyFatDirection as AiraUserProfile["derived"]["bodyFatDirection"]) ?? "maintain",
+      targetGoal:       (derivedBlock.targetGoal       as string)                                         ?? "general_fitness",
+      workoutFrequency: (derivedBlock.workoutFrequency as AiraUserProfile["derived"]["workoutFrequency"]) ?? "3x",
+      derivedAt:        (derivedBlock.derivedAt        as string)                                         ?? new Date().toISOString(),
+    },
+    meta: {
+      onboardingVersion:     (metaBlock.onboardingVersion     as number)   ?? 1,
+      completedAt:           (metaBlock.completedAt           as string)   ?? new Date().toISOString(),
+      lastUpdatedAt:         (metaBlock.lastUpdatedAt         as string)   ?? new Date().toISOString(),
+      dataConfidenceScore:   (metaBlock.dataConfidenceScore   as number)   ?? 0,
+      optionalFieldsSkipped: (metaBlock.optionalFieldsSkipped as string[]) ?? [],
+      // refinementHistory is optional — safe default is undefined (engine treats as "no history")
+      ...(metaBlock.refinementHistory && typeof metaBlock.refinementHistory === "object"
+        ? {
+            refinementHistory: {
+              lastPromptShownAt: (metaBlock.refinementHistory as Record<string, unknown>).lastPromptShownAt as string | undefined,
+              promptsSeen:       Array.isArray((metaBlock.refinementHistory as Record<string, unknown>).promptsSeen)
+                ? ((metaBlock.refinementHistory as Record<string, unknown>).promptsSeen as string[])
+                : undefined,
+            },
+          }
+        : {}),
+    },
+    // future is entirely optional — only included when at least one sub-block exists
+    ...(Object.keys(futureBlock).length > 0
+      ? {
+          future: {
+            bodyScan: (() => {
+              const bs = futureBlock.bodyScan && typeof futureBlock.bodyScan === "object"
+                ? (futureBlock.bodyScan as Record<string, unknown>)
+                : null;
+              if (!bs) return undefined;
+              return {
+                bodyFat:    bs.bodyFat    != null ? (bs.bodyFat    as number) : undefined,
+                muscleMass: bs.muscleMass != null ? (bs.muscleMass as number) : undefined,
+                takenAt:    bs.takenAt    as string | undefined,
+              };
+            })(),
+            wearables: (() => {
+              const w = futureBlock.wearables && typeof futureBlock.wearables === "object"
+                ? (futureBlock.wearables as Record<string, unknown>)
+                : null;
+              if (!w) return undefined;
+              return {
+                hasDevice:         Boolean(w.hasDevice),
+                deviceLabel:       w.deviceLabel       as string | undefined,
+                restingHeartRate:  w.restingHeartRate  != null ? (w.restingHeartRate  as number) : undefined,
+                hrv:               w.hrv               != null ? (w.hrv               as number) : undefined,
+              };
+            })(),
+            schedule: (() => {
+              const s = futureBlock.schedule && typeof futureBlock.schedule === "object"
+                ? (futureBlock.schedule as Record<string, unknown>)
+                : null;
+              if (!s) return undefined;
+              return {
+                calendarConnected: Boolean(s.calendarConnected),
+                busyBlockCount:    s.busyBlockCount != null ? (s.busyBlockCount as number) : undefined,
+              };
+            })(),
+            recovery: (() => {
+              const fr = futureBlock.recovery && typeof futureBlock.recovery === "object"
+                ? (futureBlock.recovery as Record<string, unknown>)
+                : null;
+              if (!fr) return undefined;
+              return {
+                restingHeartRate: fr.restingHeartRate != null ? (fr.restingHeartRate as number) : undefined,
+                hrv:              fr.hrv              != null ? (fr.hrv              as number) : undefined,
+              };
+            })(),
+          },
+        }
+      : {}),
+  };
+}
+
+/**
+ * Convert a GeneratedDailyPlan into the AIPlan shape the Today screen already uses.
+ * Defensive: gp comes from JSON.parse(AsyncStorage) — old stored plans may be missing
+ * fields added in later phases (e.g. meta.focus added in Phase 4 P3).
+ */
+function synthesizeAIPlan(gp: GeneratedDailyPlan): AIPlan {
+  return {
+    id:               `local_${gp.meta?.generatedAt ?? Date.now()}`,
+    date:             new Date().toISOString().slice(0, 10),
+    summary:          `${gp.workout?.focus ?? ""}. ${gp.nutrition?.keyPrinciple ?? ""}`.trim().replace(/^\. /, ""),
+    coachingNote:     gp.recovery?.notes ?? gp.meta?.reasoning?.[0] ?? "Execute the plan. Consistency compounds.",
+    disciplineTarget: gp.meta?.focus ?? `${gp.workout?.split?.replace(/_/g, " ") ?? "Today's session"}`,
+    fallbackPlan:     `Minimum viable day: hit your workout, reach your protein target, and sleep ${gp.recovery?.sleepTargetHrs ?? 8} hours.`,
+    generatedAt:      gp.meta?.generatedAt ?? new Date().toISOString(),
+  };
+}
+
+// Identity label — reflects who the user is becoming based on streak length
+function getIdentityLabel(streak: number): { label: string; color: string } {
+  if (streak >= 10) return { label: "Locked In",           color: "#66bb6a" };
+  if (streak >= 5)  return { label: "Consistent",          color: ACCENT };
+  if (streak >= 2)  return { label: "Building Discipline", color: ACCENT + "cc" };
+  return               { label: "Getting Started",      color: "#505065" };
+}
+
 // ─── Dev Mock Planner Data ───────────────────────────────────────────────────
 // Renders the Today screen with sample data when no real plan is available.
-// Only activates in __DEV__ builds. Set DEV_MOCK_ENABLED = false to disable.
-// Remove this entire block when mock data is no longer needed.
-const DEV_MOCK_ENABLED = true;
+// Only activates in __DEV__ builds when aiPlan is null and tasks is empty.
+//
+// IMPORTANT: Set DEV_MOCK_ENABLED = false to test the local Aira Intelligence
+// System (generateLocalAiraPlan). With mocks enabled, the real generation path
+// is bypassed whenever the plan is absent on app start. Restore to true for
+// UI-only development when a real plan is not needed.
+const DEV_MOCK_ENABLED = false;
 
 const DEV_MOCK_PLAN: AIPlan = {
   id:               "dev-mock-plan",
@@ -524,13 +1889,55 @@ const DEV_MOCK_WORKOUT: WorkoutSession = {
   ],
 };
 
+/** Parse AI rest strings ("90s", "2 min", "1:30") → seconds. Defaults to 60. */
+function parseRestSeconds(rest?: string): number {
+  if (!rest) return 60;
+  const s = rest.toLowerCase().trim();
+  const sec = s.match(/^(\d+)\s*s(?:ec)?s?$/);
+  if (sec) return parseInt(sec[1], 10);
+  const min = s.match(/^(\d+)\s*m(?:in)?s?$/);
+  if (min) return parseInt(min[1], 10) * 60;
+  const minSec = s.match(/^(\d+)[m:](\d+)/) ;
+  if (minSec) return parseInt(minSec[1], 10) * 60 + parseInt(minSec[2], 10);
+  const bare = parseInt(s, 10);
+  return isNaN(bare) ? 60 : bare;
+}
+
+/** Build an ExerciseSet array from a reps string ("6-8", "10", "AMRAP") and set count. */
+function buildExerciseSets(setsCount: number, repsStr: string): ExerciseSet[] {
+  const parts  = repsStr.replace(/\s*reps?\s*/i, "").split("-").map((r) => parseInt(r.trim(), 10));
+  const minRep = isNaN(parts[0]) ? 10 : parts[0];
+  const maxRep = isNaN(parts[1]) ? minRep : parts[1];
+  return Array.from({ length: setsCount }, (_, i) => {
+    // Progress linearly through the rep range across sets (min → max)
+    const frac = setsCount > 1 ? i / (setsCount - 1) : 0;
+    const reps = Math.round(minRep + frac * (maxRep - minRep));
+    return { set_number: i + 1, reps, target_weight: null };
+  });
+}
+
 /**
  * Resolve a TimedTask to a WorkoutSession.
- * V1: always returns the mock session. When the backend supplies planner-linked
- * workouts, fetch/look up by task.id or task.planId here — no other code changes.
+ * If the task carries AI-generated exercises, converts them into a full session.
+ * Falls back to the dev mock when no exercises are present (dev / legacy tasks).
  */
-function getWorkoutForTask(_task: TimedTask): WorkoutSession {
-  return DEV_MOCK_WORKOUT;
+function getWorkoutForTask(task: TimedTask): WorkoutSession {
+  const exs = task.exercises;
+  if (!exs || exs.length === 0) return DEV_MOCK_WORKOUT;
+
+  return {
+    workout_id:       task.id,
+    title:            task.title,
+    duration_minutes: 45,
+    focus:            task.title,
+    exercises: exs.map((ex, i): WorkoutExercise => ({
+      id:           `${task.id}_ex${i}`,
+      name:         ex.name,
+      sets:         buildExerciseSets(ex.sets, ex.reps),
+      rest_seconds: parseRestSeconds(ex.rest),
+      cue:          ex.notes ?? "",
+    })),
+  };
 }
 
 // ─── Dev Mock Nutrition Data ─────────────────────────────────────────────────
@@ -853,6 +2260,141 @@ function rebalanceTasks(
   });
 }
 
+// ─── Adaptive Day Engine ──────────────────────────────────────────────────────
+//
+// Rule-based, instant plan adaptation — no backend call.
+// Operates on the current task list and returns an adapted copy + coaching message.
+// The AI plan is the source of truth; adaptation is a local overlay.
+
+type AdaptResult = {
+  tasks:   TimedTask[];
+  message: string;
+  trigger: AdaptTrigger;
+};
+
+function adaptTodayPlan(tasks: TimedTask[], trigger: AdaptTrigger): AdaptResult {
+  switch (trigger) {
+    case "less_time": {
+      // Keep only done tasks + high-priority undone tasks (MUST DO)
+      // Medium/low tasks are "FLEX" — paused until time opens up
+      const compressed = tasks.filter((t) => t.done || (t.priority ?? "medium") === "high");
+      return {
+        tasks:   compressed,
+        message: "Plan compressed — high-priority tasks kept, flexible ones paused.",
+        trigger,
+      };
+    }
+    case "missed_workout": {
+      // Promote undone Workout tasks to high priority + move to front of undone list
+      // Prefix title to nudge a shorter session
+      const workouts = tasks.filter((t) => t.kind === "Workout" && !t.done);
+      const rest     = tasks.filter((t) => !(t.kind === "Workout" && !t.done));
+      const promoted = workouts.map((t) => ({
+        ...t,
+        priority: "high" as TaskPriority,
+        title: t.title.startsWith("[30 min]") ? t.title : `[30 min] ${t.title}`,
+      }));
+      return {
+        tasks:   [...promoted, ...rest],
+        message: "Workout moved up — a 20–30 min session still counts today.",
+        trigger,
+      };
+    }
+    case "low_completion": {
+      // No task list changes — coaching message is the output
+      return {
+        tasks:   tasks,
+        message: "Let's reset. Start with one small win.",
+        trigger,
+      };
+    }
+    case "low_energy": {
+      // De-intensify workout + strip low-priority tasks
+      const adjusted = tasks
+        .map((t) =>
+          t.kind === "Workout" && (t.priority ?? "medium") === "high"
+            ? { ...t, priority: "medium" as TaskPriority, title: t.title.startsWith("[Light] ") ? t.title : `[Light] ${t.title}` }
+            : t
+        )
+        .filter((t) => t.done || (t.priority ?? "medium") !== "low");
+      return {
+        tasks:   adjusted,
+        message: "Low energy mode — workout de-intensified, optional tasks removed.",
+        trigger,
+      };
+    }
+    case "shift_later": {
+      // Push all undone tasks 2 hours forward
+      const SHIFT = 2 * 60;
+      const shifted = tasks
+        .map((t) => {
+          if (t.done) return t;
+          const newMin = t.timeMin + SHIFT;
+          return { ...t, timeMin: newMin, timeText: minutesToTimeText(newMin) };
+        })
+        .sort((a, b) => a.timeMin - b.timeMin);
+      return {
+        tasks:   shifted,
+        message: "All tasks shifted 2 hours later.",
+        trigger,
+      };
+    }
+  }
+}
+
+/**
+ * Lightweight in-day rebalancer — runs continuously as the day progresses.
+ *
+ * Returns a trimmed task list when the user is behind schedule, or null when
+ * no change is needed (ON_TRACK / AHEAD). Returning null avoids unnecessary
+ * state updates and lets the existing adaptation chain remain untouched.
+ *
+ * State thresholds:
+ *   BEHIND — low completion relative to time of day → compress (strip low-priority undone)
+ *   AHEAD  — ≥70% done before 3 PM, tasks remain    → safe default: no change
+ *   ON_TRACK                                         → no change
+ *
+ * Invariants:
+ *   - Never removes done tasks
+ *   - Never removes Workout tasks (use explicit adaptation for that)
+ *   - Never modifies task data — only filters the list
+ */
+function rebalanceCurrentDay(
+  tasks:     TimedTask[],
+  doneCount: number,
+  nowMin:    number,  // minutes since midnight
+): TimedTask[] | null {
+  if (!tasks.length) return null;
+
+  const total      = tasks.length;
+  const pct        = doneCount / total;
+  const undoneCount = total - doneCount;
+
+  const isNoon      = nowMin >= 12 * 60;  // 12:00 PM
+  const isAfternoon = nowMin >= 15 * 60;  // 3:00 PM
+  const isEvening   = nowMin >= 18 * 60;  // 6:00 PM
+
+  // BEHIND — urgency increases as the day advances
+  const behind =
+    (isEvening   && pct < 0.50) ||
+    (isAfternoon && pct < 0.25) ||
+    (isNoon      && pct === 0   && undoneCount > 4);
+
+  if (behind) {
+    // Compress: keep done tasks + high/medium undone + Workout (protected)
+    const compressed = tasks.filter(
+      (t) => t.done || t.kind === "Workout" || (t.priority ?? "medium") !== "low"
+    );
+    // Only return a result if we actually removed something
+    return compressed.length < tasks.length ? compressed : null;
+  }
+
+  // AHEAD: ≥70% done before 3 PM — stable (no-op for V1)
+  // (future: pull in a later task here)
+
+  return null; // ON_TRACK — no change needed
+}
+
 function dateForDayAtMinutes(minSinceMidnight: number, dayOffset: 0 | 1) {
   const now = new Date();
   const d = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
@@ -875,6 +2417,231 @@ const KIND_COLORS: Partial<Record<TaskKind, { color: string; borderColor: string
   Sleep:     { color: "#90a4ae", borderColor: "#2e3f47", backgroundColor: "#0a1015" },
 };
 
+// Ionicons name map — used in TaskRow icon circle
+const KIND_ICONS: Partial<Record<string, string>> = {
+  Workout:   "flash-outline",
+  Nutrition: "leaf-outline",
+  Hydration: "water-outline",
+  Mobility:  "sync-outline",
+  Recovery:  "heart-outline",
+  Habit:     "star-outline",
+  Sleep:     "moon-outline",
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SkeletonCard — pulsing placeholder for async content
+// ─────────────────────────────────────────────────────────────────────────────
+
+function SkeletonCard({ height = 72, radius = 16 }: { height?: number; radius?: number }) {
+  const pulse = React.useRef(new Animated.Value(0)).current;
+
+  React.useEffect(() => {
+    Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulse, { toValue: 1, duration: 900, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
+        Animated.timing(pulse, { toValue: 0, duration: 900, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
+      ])
+    ).start();
+  }, []);
+
+  const opacity = pulse.interpolate({ inputRange: [0, 1], outputRange: [0.04, 0.09] });
+
+  return (
+    <Animated.View
+      style={{
+        height,
+        borderRadius: radius,
+        backgroundColor: "#fff",
+        opacity,
+        borderWidth: 1,
+        borderColor: "rgba(255,255,255,0.06)",
+      }}
+    />
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SkeletonTaskRow — matches TaskRow height/layout for seamless swap
+// ─────────────────────────────────────────────────────────────────────────────
+
+function SkeletonTaskRow() {
+  const pulse = React.useRef(new Animated.Value(0)).current;
+
+  React.useEffect(() => {
+    Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulse, { toValue: 1, duration: 1000, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
+        Animated.timing(pulse, { toValue: 0, duration: 1000, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
+      ])
+    ).start();
+  }, []);
+
+  const bgOpacity  = pulse.interpolate({ inputRange: [0, 1], outputRange: [0.03, 0.07] });
+  const barOpacity = pulse.interpolate({ inputRange: [0, 1], outputRange: [0.05, 0.12] });
+
+  return (
+    <Animated.View
+      style={{
+        flexDirection: "row",
+        alignItems: "center",
+        gap: 12,
+        paddingHorizontal: 14,
+        paddingVertical: 14,
+        borderRadius: 14,
+        borderWidth: 1,
+        borderColor: "rgba(255,255,255,0.05)",
+        backgroundColor: "rgba(255,255,255,0.04)",
+        marginBottom: 8,
+      }}
+    >
+      {/* Icon circle skeleton */}
+      <Animated.View style={{ width: 36, height: 36, borderRadius: 10, backgroundColor: "#fff", opacity: bgOpacity }} />
+      {/* Text lines skeleton */}
+      <View style={{ flex: 1, gap: 7 }}>
+        <Animated.View style={{ height: 13, width: "70%", borderRadius: 6, backgroundColor: "#fff", opacity: barOpacity }} />
+        <Animated.View style={{ height: 10, width: "45%", borderRadius: 6, backgroundColor: "#fff", opacity: bgOpacity }} />
+      </View>
+      {/* Toggle skeleton */}
+      <Animated.View style={{ width: 24, height: 24, borderRadius: 12, backgroundColor: "#fff", opacity: bgOpacity }} />
+    </Animated.View>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Circular Progress Ring — SVG-based, gradient stroke, glow shadow
+// ─────────────────────────────────────────────────────────────────────────────
+
+function CircularProgressRing({
+  score,
+  size = 180,
+  strokeWidth = 10,
+}: {
+  score:        number;
+  size?:        number;
+  strokeWidth?: number;
+}) {
+  const radius        = (size - strokeWidth) / 2;
+  const circumference = 2 * Math.PI * radius;
+  const targetOffset  = circumference * (1 - Math.min(Math.max(score / 100, 0), 1));
+  const cx            = size / 2;
+  const cy            = size / 2;
+
+  // Animated dash offset — starts at full circumference (empty), fills to score
+  const animDashOffset = React.useRef(new Animated.Value(circumference)).current;
+  // Glow pulse — oscillates subtly on the purple bloom shadow
+  const glowPulse      = React.useRef(new Animated.Value(0.20)).current;
+
+  // Ring fill animation — fires on mount and whenever score changes
+  React.useEffect(() => {
+    Animated.timing(animDashOffset, {
+      toValue:         targetOffset,
+      duration:        1200,
+      easing:          Easing.out(Easing.cubic),
+      useNativeDriver: false, // SVG props are not on the native thread
+    }).start();
+  }, [score]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Continuous glow pulse — 3.2 s half-cycle, asymmetric ease for natural breath feel
+  React.useEffect(() => {
+    Animated.loop(
+      Animated.sequence([
+        Animated.timing(glowPulse, { toValue: 0.44, duration: 3600, easing: Easing.inOut(Easing.sin), useNativeDriver: false }),
+        Animated.timing(glowPulse, { toValue: 0.16, duration: 3600, easing: Easing.inOut(Easing.sin), useNativeDriver: false }),
+      ])
+    ).start();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return (
+    <View style={{ width: size, height: size, alignItems: "center", justifyContent: "center" }}>
+
+      {/* ── Radial atmospheric glow — faint halo behind the ring ────────────── */}
+      {/* Blue glow — top-left */}
+      <View style={{
+        position: "absolute", width: 130, height: 130, borderRadius: 65,
+        backgroundColor: "#000",
+        shadowColor: "#00D1FF", shadowOpacity: 0.20, shadowRadius: 36,
+        shadowOffset: { width: -18, height: -18 },
+      }} />
+      {/* Pink glow — bottom-right */}
+      <View style={{
+        position: "absolute", width: 130, height: 130, borderRadius: 65,
+        backgroundColor: "#000",
+        shadowColor: "#FF3D9A", shadowOpacity: 0.16, shadowRadius: 36,
+        shadowOffset: { width: 18, height: 18 },
+      }} />
+      {/* Purple bloom — animated glow pulse */}
+      <Animated.View style={{
+        position: "absolute", width: size, height: size, borderRadius: size / 2,
+        backgroundColor: "#000",
+        shadowColor: "#7B61FF", shadowOpacity: glowPulse, shadowRadius: 38,
+        shadowOffset: { width: 0, height: 0 },
+      }} />
+
+      {/* ── SVG ring ─────────────────────────────────────────────────────────── */}
+      <Svg width={size} height={size} style={{ position: "absolute" }}>
+        <Defs>
+          <SvgLinearGradient id="ringGrad" x1="0" y1="0" x2="1" y2="1">
+            <Stop offset="0"   stopColor="#00D1FF" stopOpacity="1" />
+            <Stop offset="0.5" stopColor="#7B61FF" stopOpacity="1" />
+            <Stop offset="1"   stopColor="#FF3D9A" stopOpacity="1" />
+          </SvgLinearGradient>
+        </Defs>
+        {/* Track */}
+        <Circle
+          cx={cx} cy={cy} r={radius}
+          stroke="#14142a"
+          strokeWidth={strokeWidth}
+          fill="none"
+        />
+        {/* Animated progress arc */}
+        <AnimatedCircle
+          cx={cx} cy={cy} r={radius}
+          stroke="url(#ringGrad)"
+          strokeWidth={strokeWidth}
+          fill="none"
+          strokeDasharray={circumference}
+          strokeDashoffset={animDashOffset}
+          strokeLinecap="round"
+          transform={`rotate(-90 ${cx} ${cy})`}
+        />
+      </Svg>
+
+      {/* ── Center content ───────────────────────────────────────────────────── */}
+      <View style={{ alignItems: "center" }}>
+        <Text style={{
+          color:         "#2a2a45",
+          fontSize:      8,
+          fontWeight:    "900",
+          letterSpacing: 2,
+          marginBottom:  4,
+        }}>
+          SCORE
+        </Text>
+        <Text style={{
+          color:            "#ffffff",
+          fontSize:         48,
+          fontWeight:       "800",
+          letterSpacing:    -1.5,
+          lineHeight:       50,
+          textShadowColor:  "#7B61FF38",
+          textShadowRadius: 10,
+          textShadowOffset: { width: 0, height: 0 },
+        }}>
+          {score}
+        </Text>
+        <Text style={{
+          color:         "#2c2c44",
+          fontSize:      8,
+          fontWeight:    "700",
+          letterSpacing: 1.8,
+          marginTop:     4,
+        }}>
+          DISCIPLINE
+        </Text>
+      </View>
+    </View>
+  );
+}
 
 // ---------- Nutrition guidance ----------
 type NutritionGuide = { protein: string; hydration: string; priority: string };
@@ -884,6 +2651,56 @@ const TARGET_GOAL_LABELS: Record<string, string> = {
   model_build:     "Model Build",
   athletic_strong: "Athletic & Strong",
   shredded:        "Shredded",
+};
+
+// ── Performance profile mapping constants ────────────────────────────────────
+const GOAL_TYPE_LABELS: Record<string, string> = {
+  lose_fat:            "Lose fat and get lean",
+  build_muscle:        "Build muscle and size",
+  get_stronger:        "Get stronger and more powerful",
+  improve_athleticism: "Improve athleticism and performance",
+  stay_consistent:     "Build discipline and stay consistent",
+};
+
+// Maps primaryTrainingStyle → legacy targetGoal (for buildTodaysPlan workout naming)
+const TRAINING_STYLE_TO_TARGET: Record<string, string> = {
+  athlete:         "athletic_strong",
+  muscle:          "model_build",
+  strength:        "athletic_strong",
+  fat_loss:        "shredded",
+  general_fitness: "lean_defined",
+  calisthenics:    "lean_defined",
+};
+
+// Maps goalType → legacy bodyFatDirection
+const GOAL_TYPE_TO_BFD: Record<string, Profile["derived"]["bodyFatDirection"]> = {
+  lose_fat:            "lose_fat",
+  build_muscle:        "build_lean",
+  get_stronger:        "maintain",
+  improve_athleticism: "maintain",
+  stay_consistent:     "maintain",
+};
+
+// Maps gymAccess → legacy equipment
+const GYM_ACCESS_TO_EQUIPMENT: Record<string, Profile["derived"]["equipment"]> = {
+  full_gym:          "full_gym",
+  limited_equipment: "minimal",
+  bodyweight_only:   "none",
+};
+
+// Maps trainingDaysPerWeek → legacy workoutFrequency
+function daysToFrequency(d: number): Profile["derived"]["workoutFrequency"] {
+  if (d <= 2) return "2x";
+  if (d === 3) return "3x";
+  if (d === 4) return "4x";
+  return "5x";
+}
+
+// Maps experienceLevel → session duration default
+const EXP_TO_DURATION: Record<string, Profile["training"]["sessionDuration"]> = {
+  beginner:     "30min",
+  intermediate: "45min",
+  advanced:     "60min",
 };
 
 const NUTRITION_GUIDANCE: Record<string, NutritionGuide> = {
@@ -935,23 +2752,23 @@ const SAMPLE_USERS: Omit<LeaderboardEntry, "isMe">[] = [
 
 // ---------- Styles ----------
 const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: "#000000", padding: 16, gap: 12 },
+  screen: { flex: 1, backgroundColor: "transparent", padding: 16, gap: 12 },
 
-  h1: { color: "#fff", fontSize: 34, fontWeight: "800" },
-  h2: { color: "#fff", fontSize: 26, fontWeight: "800" },
+  h1: { color: "#fff", fontSize: 34, fontWeight: "700", letterSpacing: -0.5 },
+  h2: { color: "#fff", fontSize: 26, fontWeight: "700", letterSpacing: -0.3 },
   sub: { color: "#bdbdbd", fontSize: 14, marginBottom: 6 },
   sub2: { color: "#bdbdbd", fontSize: 13, marginBottom: 6 },
 
-  card: { backgroundColor: "#121212", borderRadius: 16, padding: 14, borderWidth: 1, borderColor: "#1a1a2e", gap: 8 },
+  card: { backgroundColor: "#0A0A0F", borderRadius: 16, padding: 14, borderWidth: 1, borderColor: "#1a1a2c", gap: 8, shadowColor: "#000", shadowOpacity: 0.55, shadowRadius: 18, shadowOffset: { width: 0, height: 5 }, elevation: 7 },
 
   label: { color: "#fff", fontSize: 14, fontWeight: "700" },
   smallLabel: { color: "#bdbdbd", fontSize: 12, fontWeight: "700", marginTop: 4 },
-  bodyMuted: { color: "#bdbdbd", fontSize: 13, lineHeight: 18 },
+  bodyMuted: { color: "#bdbdbd", fontSize: 13, lineHeight: 20 },
   miniNote: { color: "#777", fontSize: 12, lineHeight: 16 },
 
   input: { backgroundColor: "#0f0f0f", borderWidth: 1, borderColor: "#262626", borderRadius: 12, padding: 12, color: "#fff" },
 
-  primaryBtn: { backgroundColor: ACCENT, padding: 14, borderRadius: 14, alignItems: "center", width: "100%" },
+  primaryBtn: { backgroundColor: ACCENT, padding: 14, borderRadius: 14, alignItems: "center", width: "100%", shadowColor: "#7B61FF", shadowOpacity: 0.5, shadowRadius: 20, shadowOffset: { width: 0, height: 6 }, elevation: 8 },
   primaryBtnText: { color: "#ffffff", fontWeight: "800", fontSize: 14 },
 
   smallBtn: {
@@ -1009,9 +2826,9 @@ const styles = StyleSheet.create({
   removeBtn: { backgroundColor: "#141414", borderWidth: 1, borderColor: "#2a2a2a", borderRadius: 12, paddingVertical: 8, paddingHorizontal: 10 },
   removeText: { color: "#fff", fontWeight: "900", fontSize: 12 },
 
-  tabBar: { flexDirection: "row", gap: 8, paddingTop: 10, borderTopWidth: 1, borderTopColor: "#1e1e1e" },
+  tabBar: { flexDirection: "row", gap: 8, paddingTop: 10, paddingBottom: 4, borderTopWidth: 1, borderTopColor: "#1e1e1e", overflow: "visible" },
   tabBtn: { flex: 1, backgroundColor: "#0f0f0f", borderWidth: 1, borderColor: "#262626", borderRadius: 14, paddingVertical: 10, alignItems: "center" },
-  tabBtnActive: { backgroundColor: ACCENT, borderColor: ACCENT },
+  tabBtnActive: { backgroundColor: ACCENT, borderColor: ACCENT, shadowColor: ACCENT, shadowOpacity: 0.22, shadowRadius: 8, shadowOffset: { width: 0, height: 2 }, elevation: 4 },
   tabText: { color: "#bdbdbd", fontWeight: "900", fontSize: 11 },
   tabTextActive: { color: "#ffffff" },
 });
@@ -1030,10 +2847,55 @@ function PrimaryButton({
   onPress: () => void;
   disabled?: boolean;
 }) {
+  const scaleAnim = React.useRef(new Animated.Value(1)).current;
+  const glowAnim  = React.useRef(new Animated.Value(0.22)).current;
+
+  const handlePressIn = () => {
+    Animated.timing(scaleAnim, { toValue: 0.97, duration: 80, easing: Easing.out(Easing.quad), useNativeDriver: true }).start();
+    Animated.timing(glowAnim,  { toValue: 0.38, duration: 120, useNativeDriver: false }).start();
+  };
+
+  const handlePressOut = () => {
+    Animated.spring(scaleAnim, { toValue: 1, friction: 6, tension: 220, useNativeDriver: true }).start();
+    Animated.timing(glowAnim,  { toValue: 0.22, duration: 180, useNativeDriver: false }).start();
+  };
+
+  // Outer view: shadow only — useNativeDriver:false (shadowOpacity is a layout prop)
+  // Inner view: transform only — useNativeDriver:true (scale is a native-safe prop)
+  // Keeping them on separate Animated.Views avoids the mixed-driver conflict.
   return (
-    <Pressable onPress={onPress} disabled={disabled} style={[styles.primaryBtn, disabled && { opacity: 0.5 }]}>
-      <Text style={styles.primaryBtnText}>{title}</Text>
-    </Pressable>
+    <Animated.View style={{
+      width:         "100%",
+      borderRadius:  14,
+      shadowColor:   "#7B61FF",
+      shadowOpacity: glowAnim,
+      shadowRadius:  12,
+      shadowOffset:  { width: 0, height: 4 },
+      elevation:     6,
+    }}>
+      <Animated.View style={{
+        transform: [{ scale: scaleAnim }],
+        opacity:   disabled ? 0.45 : 1,
+        borderRadius: 14,
+      }}>
+        <Pressable
+          onPress={onPress}
+          onPressIn={handlePressIn}
+          onPressOut={handlePressOut}
+          disabled={disabled}
+          style={{ borderRadius: 14, overflow: "hidden" }}
+        >
+          <LinearGradient
+            colors={["#5e7fff", "#7B61FF", "#a855f7"]}
+            start={{ x: 0, y: 0 }}
+            end={{ x: 1, y: 0 }}
+            style={{ padding: 14, alignItems: "center", opacity: 0.92 }}
+          >
+            <Text style={styles.primaryBtnText}>{title}</Text>
+          </LinearGradient>
+        </Pressable>
+      </Animated.View>
+    </Animated.View>
   );
 }
 
@@ -1053,68 +2915,124 @@ function SmallButton({ title, onPress }: { title: string; onPress: () => void })
   );
 }
 
-function Splash() {
-  const fadeAnim = React.useRef(new Animated.Value(0)).current;
+function Splash({
+  ready    = false,
+  onFinish,
+}: {
+  ready?:    boolean;
+  onFinish?: () => void;
+}) {
+  // ── Animations ─────────────────────────────────────────────────────────────
+  // exitOpacity: wraps entire screen, fades to 0 on exit
+  const exitOpacity  = React.useRef(new Animated.Value(1)).current;
+  // progressAnim: drives fill width + dot translateX (useNativeDriver:false — layout prop)
+  const BAR_WIDTH    = Dimensions.get("window").width * 0.6;
+  const progressAnim = React.useRef(new Animated.Value(0)).current;
 
+  // Progress — 0 → BAR_WIDTH over 4600ms ease-out, completes just before the 5s gate
   useEffect(() => {
-    Animated.timing(fadeAnim, {
-      toValue: 1,
-      duration: 480,
-      useNativeDriver: true,
+    Animated.timing(progressAnim, {
+      toValue:         BAR_WIDTH,
+      duration:        4600,
+      easing:          Easing.out(Easing.cubic),
+      useNativeDriver: false,
     }).start();
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Exit — 300ms delay after parent signals ready, then 600ms fade, then unmount
+  useEffect(() => {
+    if (!ready) return;
+    const t = setTimeout(() => {
+      Animated.timing(exitOpacity, {
+        toValue:         0,
+        duration:        600,
+        easing:          Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }).start(() => onFinish?.());
+    }, 300);
+    return () => clearTimeout(t);
+  }, [ready]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
-    <View style={{ flex: 1, backgroundColor: "#000", alignItems: "center", justifyContent: "center" }}>
-      <StatusBar barStyle="light-content" backgroundColor="#000" />
+    // Outermost wrapper: black bg prevents any white bleed on edges or during exit fade
+    <Animated.View style={{ flex: 1, backgroundColor: "#000000", opacity: exitOpacity }}>
+      <StatusBar barStyle="light-content" backgroundColor="#000000" />
 
-      <Animated.View style={{ alignItems: "center", opacity: fadeAnim }}>
-        {/* Icon mark */}
+      {/*
+        Full-screen image — aira-splash-logo.png contains the entire visual design
+        (background, glows, logo). resizeMode "cover" fills edge to edge.
+        backgroundColor="#000000" on ImageBackground style eliminates any gap
+        if the image doesn't perfectly cover due to device aspect ratios.
+      */}
+      <ImageBackground
+        source={require("../assets/branding/aira-splash-logo.png")}
+        style={{ flex: 1, width: "100%", height: "100%", backgroundColor: "#000000" }}
+        resizeMode="cover"
+      >
+        {/* ── Progress bar + Loading text — 13% from bottom ─────────────────── */}
         <View style={{
-          width: 76,
-          height: 76,
-          borderRadius: 22,
-          backgroundColor: "#0a0a14",
-          borderWidth: 1,
-          borderColor: ACCENT + "28",
+          position:   "absolute",
+          bottom:     "13%",
+          left:       0,
+          right:      0,
           alignItems: "center",
-          justifyContent: "center",
-          marginBottom: 28,
-          shadowColor: ACCENT,
-          shadowOpacity: 0.18,
-          shadowRadius: 24,
-          shadowOffset: { width: 0, height: 0 },
+          gap:        10,
         }}>
-          <Text style={{ color: ACCENT, fontSize: 34, fontWeight: "900", letterSpacing: -1 }}>A</Text>
+          {/*
+            BAR_WIDTH container: fixed pixel size gives animated children a stable
+            coordinate space. overflow:hidden on the track clips the gradient fill.
+            The dot is a sibling of the track (not inside it) so it isn't clipped.
+          */}
+          <View style={{ width: BAR_WIDTH, height: 3 }}>
+
+            {/* Track — translucent white background, clips animated fill */}
+            <View style={{
+              position:        "absolute",
+              top: 0, left: 0, right: 0, bottom: 0,
+              borderRadius:    1.5,
+              backgroundColor: "rgba(255,255,255,0.10)",
+              overflow:        "hidden",
+            }}>
+              {/* Animated fill — grows from 0 → BAR_WIDTH, always renders full gradient inside */}
+              <Animated.View style={{ width: progressAnim, height: 3, overflow: "hidden" }}>
+                <LinearGradient
+                  colors={["#00c8ff", "#a020f0", "#ff2d9b"]}
+                  start={{ x: 0, y: 0 }}
+                  end={{ x: 1, y: 0 }}
+                  style={{ width: BAR_WIDTH, height: 3 }}
+                />
+              </Animated.View>
+            </View>
+
+            {/* Leading-edge dot — 7×7 white circle with cyan glow, tracks fill position */}
+            <Animated.View style={{
+              position:        "absolute",
+              top:             -2,    // centers 7px dot vertically on 3px bar: (3−7)/2 = −2
+              left:            -3.5,  // straddles the edge: offset by half dot width
+              width:           7,
+              height:          7,
+              borderRadius:    3.5,
+              backgroundColor: "#ffffff",
+              shadowColor:     "#00c8ff",
+              shadowOpacity:   0.95,
+              shadowRadius:    8,
+              shadowOffset:    { width: 0, height: 0 },
+              transform:       [{ translateX: progressAnim }],
+            }} />
+          </View>
+
+          {/* Loading text */}
+          <Text style={{
+            color:         "rgba(255,255,255,0.55)",
+            fontSize:      14,
+            fontWeight:    "300",
+            letterSpacing: 0.5,
+          }}>
+            Loading...
+          </Text>
         </View>
-
-        {/* Wordmark */}
-        <Text style={{
-          color: "#ffffff",
-          fontSize: 26,
-          fontWeight: "900",
-          letterSpacing: 6,
-          marginBottom: 8,
-        }}>
-          AIRA
-        </Text>
-
-        {/* Tagline */}
-        <Text style={{
-          color: "#3a3a55",
-          fontSize: 10,
-          fontWeight: "700",
-          letterSpacing: 3,
-        }}>
-          DISCIPLINE ENGINE
-        </Text>
-
-        {/* Loading indicator */}
-        <View style={{ marginTop: 52 }}>
-          <ActivityIndicator size="small" color="#2a2a40" />
-        </View>
-      </Animated.View>
-    </View>
+      </ImageBackground>
+    </Animated.View>
   );
 }
 
@@ -1135,18 +3053,90 @@ const KIND_DURATION: Partial<Record<TaskKind, string>> = {
 };
 
 // ---------- Workout Detail Modal ----------
+/** Map a GeneratedDailyPlan workout to the WorkoutSession shape the modal renders. */
+function workoutPlanToSession(
+  task: TimedTask,
+  wp: GeneratedDailyPlan["workout"],
+): WorkoutSession {
+  return {
+    workout_id:       task.id,
+    title:            wp.focus,
+    duration_minutes: wp.durationMins,
+    focus:            wp.focus,
+    exercises: wp.exercises.map((ex, i): WorkoutExercise => ({
+      id:           `${task.id}_ex${i}`,
+      name:         ex.name,
+      sets:         buildExerciseSets(ex.sets, ex.reps),
+      rest_seconds: parseRestSeconds(ex.rest),
+      cue:          ex.notes ?? "",
+    })),
+  };
+}
+
+/** Map a GeneratedDailyPlan nutrition plan to the local NutritionPlan shape. */
+function generatedNutritionToLocal(gn: GeneratedDailyPlan["nutrition"]): NutritionPlan {
+  const strategy = gn.caloricStrategy ?? "maintenance";
+  const calories = gn.dailyTarget?.calories ?? 0;
+  return {
+    plan_id:   "generated",
+    title:     `${strategy.charAt(0).toUpperCase() + strategy.slice(1)} — ${calories} kcal`,
+    focus:     gn.keyPrinciple ?? "",
+    calories,
+    protein_g: gn.dailyTarget?.protein ?? null,
+    meals: (gn.meals ?? []).map((m, i): MealEntry => ({
+      id:      `meal_${i}`,
+      label:   m.name ?? "",
+      time:    m.timing ?? "",
+      focus:   m.focus ?? "",
+      example: m.description ?? "",
+    })),
+    groceryList: gn.supplements ?? [],
+  };
+}
+
+/** Map a GeneratedDailyPlan recovery plan to the local RecoveryPlan shape. */
+function generatedRecoveryToLocal(
+  gr: GeneratedDailyPlan["recovery"],
+  taskTitle: string,
+): RecoveryPlan {
+  const t        = taskTitle.toLowerCase();
+  const isSleep  = t.includes("sleep") || t.includes("wind") || t.includes("bed");
+  // Guard: old stored plans may lack protocol arrays
+  const protocols = (isSleep ? gr.eveningProtocols : gr.morningProtocols) ?? [];
+  const type: RecoveryPlan["type"] = isSleep ? "Sleep" : gr.readinessTier === "Recover" ? "Rest" : "Stretch";
+  const totalMins = protocols.reduce((sum, p) => sum + (p.durationMins ?? 0), 0);
+  return {
+    plan_id:      "generated",
+    type,
+    title:        isSleep ? `Sleep — ${gr.sleepTargetHrs ?? 8}h target` : `Recovery — ${gr.readinessTier ?? "Maintain"}`,
+    focus:        gr.notes ?? (gr.readinessTier === "Recover"
+      ? "Focus on restoration today — mobility, hydration, and clean nutrition."
+      : "Support your training with deliberate recovery habits."),
+    duration_min: totalMins > 0 ? totalMins : null,
+    steps: protocols.map((p, i): RecoveryStep => ({
+      id:       `rp_${i}`,
+      label:    p.name ?? "",
+      duration: `${p.durationMins ?? 0} min`,
+      cue:      p.description ?? "",
+    })),
+    coachingCue: gr.notes ?? "Consistency in recovery compounds just like consistency in training.",
+  };
+}
+
 function WorkoutDetailModal({
   task,
   taskDone,
   visible,
   onClose,
   onCompleteTask,
+  workoutPlan,
 }: {
   task:            TimedTask | null;
   taskDone:        boolean;          // live from global tasks — never stale
   visible:         boolean;
   onClose:         () => void;
   onCompleteTask:  (id: string) => void;
+  workoutPlan?:    GeneratedDailyPlan["workout"];
 }) {
   const [completedIds, setCompletedIds] = React.useState<Set<string>>(new Set());
 
@@ -1157,7 +3147,9 @@ function WorkoutDetailModal({
   const cardYRef           = React.useRef<Record<string, number>>({});
   const listContainerYRef  = React.useRef(0);
 
-  const workout        = task ? getWorkoutForTask(task) : null;
+  const workout = task
+    ? (workoutPlan ? workoutPlanToSession(task, workoutPlan) : getWorkoutForTask(task))
+    : null;
   const totalExercises = workout?.exercises.length ?? 0;
 
   // When the modal opens:
@@ -1298,36 +3290,36 @@ function WorkoutDetailModal({
         >
 
           {/* ── Workout identity ──────────────────────────────────────────────── */}
-          <View style={{ marginBottom: 28 }}>
+          <View style={{ marginBottom: 24 }}>
             <View style={{ flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 14 }}>
               <View style={{ backgroundColor: "#0e0c2a", borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3 }}>
                 <Text style={{ color: "#a89fff", fontSize: 10, fontWeight: "800", letterSpacing: 0.8 }}>WORKOUT</Text>
               </View>
-              <Text style={{ color: "#2e2e48", fontSize: 11, fontWeight: "600" }}>
+              <Text style={{ color: "#3a3a5a", fontSize: 11, fontWeight: "600" }}>
                 {workout.duration_minutes} min
               </Text>
             </View>
 
             <Text style={{
               color: "#eeeef5",
-              fontSize: 26,
+              fontSize: 24,
               fontWeight: "900",
               letterSpacing: -0.8,
-              lineHeight: 32,
-              marginBottom: 6,
+              lineHeight: 30,
+              marginBottom: 8,
             }}>
               {workout.title}
             </Text>
-            <Text style={{ color: "#4a4a7a", fontSize: 13, fontWeight: "600" }}>
+            <Text style={{ color: "#4a4a7a", fontSize: 13, fontWeight: "500" }}>
               {workout.focus}
             </Text>
           </View>
 
           {/* ── Progress bar ──────────────────────────────────────────────────── */}
-          <View style={{ marginBottom: 32 }}>
-            <View style={{ height: 3, backgroundColor: "#111120", borderRadius: 2, overflow: "hidden", marginBottom: 8 }}>
+          <View style={{ marginBottom: 28 }}>
+            <View style={{ height: 4, backgroundColor: "#111120", borderRadius: 2, overflow: "hidden", marginBottom: 8 }}>
               <View style={{
-                height: 3,
+                height: 4,
                 width: `${progressPct}%` as any,
                 backgroundColor: allDone ? "#66bb6a" : ACCENT,
                 borderRadius: 2,
@@ -1405,13 +3397,13 @@ function WorkoutDetailModal({
                     style={{
                       backgroundColor: "#0d0b22",
                       borderWidth: 1,
-                      borderColor: "#3d35a0",
+                      borderColor: ACCENT + "88",
                       borderRadius: 16,
                       overflow: "hidden",
                     }}
                   >
                     {/* ACCENT top strip — signals "you are here" */}
-                    <View style={{ height: 3, backgroundColor: ACCENT }} />
+                    <View style={{ height: 4, backgroundColor: ACCENT }} />
 
                     <View style={{ padding: 20, gap: 18 }}>
 
@@ -1503,9 +3495,14 @@ function WorkoutDetailModal({
                           paddingVertical: 17,
                           alignItems: "center",
                           marginTop: 2,
+                          shadowColor: ACCENT,
+                          shadowOpacity: 0.3,
+                          shadowRadius: 14,
+                          shadowOffset: { width: 0, height: 4 },
+                          elevation: 6,
                         }}
                       >
-                        <Text style={{ color: "#fff", fontSize: 15, fontWeight: "900", letterSpacing: 0.3 }}>
+                        <Text style={{ color: "#fff", fontSize: 15, fontWeight: "800", letterSpacing: 0.3 }}>
                           {isLastExercise ? "Finish workout →" : "Done — next exercise →"}
                         </Text>
                       </Pressable>
@@ -1568,15 +3565,15 @@ function WorkoutDetailModal({
             <View style={{ marginTop: 28, gap: 12 }}>
               {/* Summary banner */}
               <View style={{
-                backgroundColor: "#66bb6a0e",
+                backgroundColor: "#66bb6a0a",
                 borderWidth: 1,
-                borderColor: "#66bb6a28",
-                borderRadius: 16,
-                padding: 20,
+                borderColor: "#66bb6a25",
+                borderRadius: 14,
+                padding: 16,
                 alignItems: "center",
                 gap: 6,
               }}>
-                <Text style={{ color: "#66bb6a", fontSize: 22, fontWeight: "900", letterSpacing: -0.5 }}>
+                <Text style={{ color: "#66bb6a", fontSize: 18, fontWeight: "800", letterSpacing: -0.5 }}>
                   Workout done
                 </Text>
                 <Text style={{ color: "#66bb6a50", fontSize: 13, fontWeight: "500" }}>
@@ -1586,7 +3583,7 @@ function WorkoutDetailModal({
                 {taskDone && (
                   <View style={{ flexDirection: "row", alignItems: "center", gap: 5, marginTop: 4 }}>
                     <Text style={{ color: "#66bb6a60", fontSize: 11, fontWeight: "700" }}>✓</Text>
-                    <Text style={{ color: "#66bb6a60", fontSize: 11, fontWeight: "600" }}>Logged in today's plan</Text>
+                    <Text style={{ color: "#66bb6a60", fontSize: 11, fontWeight: "600" }}>Logged in today&apos;s plan</Text>
                   </View>
                 )}
               </View>
@@ -1601,6 +3598,11 @@ function WorkoutDetailModal({
                   borderRadius: 14,
                   paddingVertical: 16,
                   alignItems: "center",
+                  shadowColor: taskDone ? "#66bb6a" : "transparent",
+                  shadowOpacity: taskDone ? 0.28 : 0,
+                  shadowRadius: 12,
+                  shadowOffset: { width: 0, height: 4 },
+                  elevation: taskDone ? 6 : 0,
                 }}
               >
                 <Text style={{
@@ -1770,16 +3772,20 @@ function NutritionDetailModal({
   visible,
   onClose,
   onCompleteTask,
+  nutritionPlan,
 }: {
   task:           TimedTask | null;
   taskDone:       boolean;
   visible:        boolean;
   onClose:        () => void;
   onCompleteTask: (id: string) => void;
+  nutritionPlan?: GeneratedDailyPlan["nutrition"];
 }) {
   const [checkedMeals, setCheckedMeals] = React.useState<Set<string>>(new Set());
 
-  const plan        = task ? getNutritionForTask(task) : null;
+  const plan = task
+    ? (nutritionPlan ? generatedNutritionToLocal(nutritionPlan) : getNutritionForTask(task))
+    : null;
   const totalMeals  = plan?.meals.length ?? 0;
   const doneCount   = checkedMeals.size;
   const allDone     = totalMeals > 0 && doneCount === totalMeals;
@@ -1878,12 +3884,12 @@ function NutritionDetailModal({
         >
 
           {/* ── Identity ──────────────────────────────────────────────────────── */}
-          <View style={{ marginBottom: 26 }}>
+          <View style={{ marginBottom: 24 }}>
             <View style={{ flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 14 }}>
               <View style={{ backgroundColor: NUTRITION_BG, borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3 }}>
                 <Text style={{ color: NUTRITION_COLOR, fontSize: 10, fontWeight: "800", letterSpacing: 0.8 }}>NUTRITION</Text>
               </View>
-              <Text style={{ color: "#2e2e48", fontSize: 11, fontWeight: "600" }}>{task.timeText}</Text>
+              <Text style={{ color: "#3a3a5a", fontSize: 11, fontWeight: "600" }}>{task.timeText}</Text>
             </View>
 
             <Text style={{
@@ -1951,9 +3957,9 @@ function NutritionDetailModal({
 
           {/* ── Progress bar ──────────────────────────────────────────────────── */}
           <View style={{ marginBottom: 28 }}>
-            <View style={{ height: 3, backgroundColor: "#111120", borderRadius: 2, overflow: "hidden", marginBottom: 8 }}>
+            <View style={{ height: 4, backgroundColor: "#111120", borderRadius: 2, overflow: "hidden", marginBottom: 8 }}>
               <View style={{
-                height: 3,
+                height: 4,
                 width: `${progressPct}%` as any,
                 backgroundColor: allDone ? GREEN : NUTRITION_COLOR,
                 borderRadius: 2,
@@ -2119,6 +4125,11 @@ function NutritionDetailModal({
               borderRadius: 14,
               paddingVertical: 16,
               alignItems: "center",
+              shadowColor: taskDone ? "transparent" : NUTRITION_COLOR,
+              shadowOpacity: taskDone ? 0 : 0.28,
+              shadowRadius: 12,
+              shadowOffset: { width: 0, height: 4 },
+              elevation: taskDone ? 0 : 6,
             }}
           >
             <Text style={{
@@ -2144,16 +4155,20 @@ function RecoveryDetailModal({
   visible,
   onClose,
   onCompleteTask,
+  recoveryPlan,
 }: {
   task:           TimedTask | null;
   taskDone:       boolean;
   visible:        boolean;
   onClose:        () => void;
   onCompleteTask: (id: string) => void;
+  recoveryPlan?:  GeneratedDailyPlan["recovery"];
 }) {
   const [checkedSteps, setCheckedSteps] = React.useState<Set<string>>(new Set());
 
-  const plan        = task ? getRecoveryForTask(task) : null;
+  const plan = task
+    ? (recoveryPlan ? generatedRecoveryToLocal(recoveryPlan, task.title) : getRecoveryForTask(task))
+    : null;
   const totalSteps  = plan?.steps.length ?? 0;
   const doneCount   = checkedSteps.size;
   const allDone     = totalSteps > 0 && doneCount === totalSteps;
@@ -2267,7 +4282,7 @@ function RecoveryDetailModal({
         >
 
           {/* ── Identity ──────────────────────────────────────────────────────── */}
-          <View style={{ marginBottom: 26 }}>
+          <View style={{ marginBottom: 24 }}>
             <View style={{ flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 14 }}>
               <View style={{ backgroundColor: RECOVERY_BG, borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3 }}>
                 <Text style={{ color: RECOVERY_COLOR, fontSize: 10, fontWeight: "800", letterSpacing: 0.8 }}>RECOVERY</Text>
@@ -2326,9 +4341,9 @@ function RecoveryDetailModal({
 
           {/* ── Progress bar ──────────────────────────────────────────────────── */}
           <View style={{ marginBottom: 28 }}>
-            <View style={{ height: 3, backgroundColor: "#111120", borderRadius: 2, overflow: "hidden", marginBottom: 8 }}>
+            <View style={{ height: 4, backgroundColor: "#111120", borderRadius: 2, overflow: "hidden", marginBottom: 8 }}>
               <View style={{
-                height: 3,
+                height: 4,
                 width: `${progressPct}%` as any,
                 backgroundColor: allDone ? GREEN : RECOVERY_COLOR,
                 borderRadius: 2,
@@ -2475,10 +4490,15 @@ function RecoveryDetailModal({
               borderRadius: 14,
               paddingVertical: 16,
               alignItems: "center",
+              shadowColor: taskDone ? "transparent" : RECOVERY_COLOR,
+              shadowOpacity: taskDone ? 0 : 0.28,
+              shadowRadius: 12,
+              shadowOffset: { width: 0, height: 4 },
+              elevation: taskDone ? 0 : 6,
             }}
           >
             <Text style={{
-              color: taskDone ? "#444" : "#0a0010",
+              color: taskDone ? "#444" : "#fff",
               fontSize: 15,
               fontWeight: "800",
               letterSpacing: 0.2,
@@ -2619,7 +4639,7 @@ function HabitDetailModal({
 
             <ScrollView
               showsVerticalScrollIndicator={false}
-              contentContainerStyle={{ paddingHorizontal: 24, paddingBottom: 36 }}
+              contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 36 }}
             >
               {/* ── Kind + priority header ─────────────────────────────────────── */}
               <View style={{
@@ -2673,15 +4693,15 @@ function HabitDetailModal({
 
               {/* ── Instruction + cue card ────────────────────────────────────────── */}
               <View style={{
-                backgroundColor: "#080810",
+                backgroundColor: "#08080f",
                 borderWidth: 1,
-                borderColor: "#14142a",
+                borderColor: "#141420",
                 borderRadius: 14,
                 padding: 16,
                 gap: 10,
                 marginBottom: 28,
               }}>
-                <Text style={{ color: "#50507a", fontSize: 10, fontWeight: "800", letterSpacing: 1 }}>
+                <Text style={{ color: "#40405a", fontSize: 10, fontWeight: "800", letterSpacing: 1 }}>
                   DO THIS NOW
                 </Text>
                 <Text style={{ color: "#9090b8", fontSize: 14, lineHeight: 22, fontWeight: "500" }}>
@@ -2703,6 +4723,11 @@ function HabitDetailModal({
                   borderRadius: 14,
                   paddingVertical: 16,
                   alignItems: "center",
+                  shadowColor: taskDone ? "transparent" : HABIT_COLOR,
+                  shadowOpacity: taskDone ? 0 : 0.25,
+                  shadowRadius: 12,
+                  shadowOffset: { width: 0, height: 4 },
+                  elevation: taskDone ? 0 : 5,
                 }}
               >
                 <Text style={{
@@ -2902,90 +4927,224 @@ function TaskRow({
   task,
   onToggle,
   onDetail,
+  isNext,
 }: {
   task:     TimedTask;
   onToggle: () => void;
   onDetail: () => void;
+  isNext?:  boolean;
 }) {
   const priority  = task.priority ?? "medium";
-  const accentBar = task.done ? "#1e1e26" : (PRIORITY_LEFT_COLOR[priority] ?? "#2a2a2a");
-  const kindColor = KIND_COLORS[task.kind]?.color ?? "#555";
+  const kindColor = KIND_COLORS[task.kind]?.color ?? "#6C63FF";
+  const kindIcon  = KIND_ICONS[task.kind] ?? "·";
+  const isLowFlex = !task.done && priority === "low";
+
+  // ── Micro-interactions ──────────────────────────────────────────────────────
+  // Scale: shrinks slightly on completion then springs back
+  const scaleAnim    = React.useRef(new Animated.Value(1)).current;
+  // Flash: brief green overlay when marked done
+  const flashOpacity = React.useRef(new Animated.Value(0)).current;
+  // Track previous done state so we only trigger on the rising edge
+  const prevDoneRef  = React.useRef(task.done);
+
+  React.useEffect(() => {
+    if (task.done && !prevDoneRef.current) {
+      // Scale down → controlled spring back
+      Animated.sequence([
+        Animated.timing(scaleAnim, { toValue: 0.965, duration: 80, easing: Easing.out(Easing.quad), useNativeDriver: true }),
+        Animated.spring(scaleAnim, { toValue: 1, friction: 6, tension: 220, useNativeDriver: true }),
+      ]).start();
+      // Green glow flash — slightly faster fade for crispness
+      Animated.sequence([
+        Animated.timing(flashOpacity, { toValue: 1, duration: 120, useNativeDriver: true }),
+        Animated.timing(flashOpacity, { toValue: 0, duration: 340, easing: Easing.out(Easing.quad), useNativeDriver: true }),
+      ]).start();
+    }
+    prevDoneRef.current = task.done;
+  }, [task.done]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Press feedback: slight scale on press-in, released on press-out
+  const handlePressIn  = () => Animated.timing(scaleAnim, { toValue: 0.98, duration: 80, easing: Easing.out(Easing.quad), useNativeDriver: true }).start();
+  const handlePressOut = () => Animated.spring(scaleAnim, { toValue: 1, friction: 6, tension: 160, useNativeDriver: true }).start();
 
   return (
+    <Animated.View style={{ transform: [{ scale: scaleAnim }] }}>
     <Pressable
       onPress={onDetail}
+      onPressIn={handlePressIn}
+      onPressOut={handlePressOut}
       style={{
-        backgroundColor: task.done ? "#0a0a0c" : "#0e0e16",
-        borderWidth: 1,
-        borderColor: task.done ? "#161620" : "#222232",
-        borderRadius: 14,
+        backgroundColor: task.done ? "rgba(255,255,255,0.02)" : "rgba(255,255,255,0.04)",
+        borderRadius: 18,
         flexDirection: "row",
+        alignItems: "center",
+        paddingVertical: 14,
+        paddingHorizontal: 14,
+        gap: 13,
+        opacity: isLowFlex ? 0.5 : 1,
         overflow: "hidden",
+        // Glow: high-priority undone → kind-tinted; next → accent; done/low → neutral
+        ...(isNext && !task.done ? {
+          borderWidth: 1,
+          borderColor: "rgba(255,255,255,0.10)",
+          shadowColor: ACCENT,
+          shadowOpacity: 0.18,
+          shadowRadius: 16,
+          shadowOffset: { width: 0, height: 6 },
+          elevation: 7,
+        } : priority === "high" && !task.done ? {
+          borderWidth: 1,
+          borderColor: "rgba(255,255,255,0.08)",
+          shadowColor: kindColor,
+          shadowOpacity: 0.10,
+          shadowRadius: 16,
+          shadowOffset: { width: 0, height: 6 },
+          elevation: 5,
+        } : {
+          borderWidth: 1,
+          borderColor: task.done ? "rgba(255,255,255,0.03)" : "rgba(255,255,255,0.06)",
+          shadowColor: "#000",
+          shadowOpacity: 0.18,
+          shadowRadius: 16,
+          shadowOffset: { width: 0, height: 6 },
+          elevation: 3,
+        }),
       }}
     >
-      {/* Priority accent bar */}
-      <View style={{ width: 3, backgroundColor: accentBar }} />
+      {/* Top highlight line — 1px glass shimmer at card top edge */}
+      {!task.done && (
+        <View
+          pointerEvents="none"
+          style={{
+            position: "absolute", top: 0, left: 20, right: 20, height: 1,
+            backgroundColor: "#ffffff",
+            opacity: 0.04,
+            borderRadius: 1,
+          }}
+        />
+      )}
+      {/* Completion glow flash — fades in/out on done transition */}
+      <Animated.View
+        pointerEvents="none"
+        style={{
+          position: "absolute", top: 0, left: 0, right: 0, bottom: 0,
+          backgroundColor: "#66bb6a",
+          opacity: flashOpacity.interpolate({ inputRange: [0, 1], outputRange: [0, 0.10] }),
+          borderRadius: 18,
+        }}
+      />
+      {/* Kind icon circle */}
+      <View style={{
+        width:            40,
+        height:           40,
+        borderRadius:     12,
+        backgroundColor:  task.done ? "#0e0e1a" : kindColor + "20",
+        alignItems:       "center",
+        justifyContent:   "center",
+        flexShrink:       0,
+        ...(task.done ? {} : {
+          shadowColor:   kindColor,
+          shadowOpacity: 0.22,
+          shadowRadius:  8,
+          shadowOffset:  { width: 0, height: 0 },
+        }),
+      }}>
+        <Ionicons
+          name={(kindIcon ?? "ellipse-outline") as any}
+          size={task.done ? 16 : 17}
+          color={task.done ? "#252535" : kindColor}
+          style={{ opacity: task.done ? 0.5 : 1 }}
+        />
+      </View>
 
       {/* Content */}
-      <View style={{ flex: 1, paddingVertical: 13, paddingLeft: 13, paddingRight: 4, gap: 5 }}>
-        {/* Title — primary */}
-        <Text
-          style={{
-            color: task.done ? "#363640" : "#e8e8ee",
-            fontSize: 14,
-            fontWeight: "700",
-            lineHeight: 20,
-            textDecorationLine: task.done ? "line-through" : "none",
-          }}
-        >
+      <View style={{ flex: 1, gap: 3 }}>
+        {/* Title */}
+        <Text style={{
+          color:              task.done ? "#26263a" : priority === "high" ? "#eeeeff" : "#d0d0e8",
+          fontSize:           14,
+          fontWeight:         priority === "high" && !task.done ? "700" : "600",
+          lineHeight:         22,
+          letterSpacing:      priority === "high" && !task.done ? -0.3 : -0.1,
+          textDecorationLine: task.done ? "line-through" : "none",
+        }}>
           {task.title}
         </Text>
 
-        {/* Meta row: time · duration · kind */}
-        <View style={{ flexDirection: "row", alignItems: "center" }}>
-          <Text style={{ color: task.done ? "#28282e" : "#50507a", fontSize: 11, fontWeight: "600", letterSpacing: 0.2 }}>
-            {task.timeText}
+        {/* Subtitle: time · priority badge · optional tag */}
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+          <Text style={{ color: task.done ? "#222232" : "#383855", fontSize: 11, fontWeight: "500", letterSpacing: 0.2 }}>
+            {formatDisplayTime(task.timeText)}
           </Text>
-          {KIND_DURATION[task.kind] && (
-            <Text style={{ color: task.done ? "#222" : "#3a3a55", fontSize: 11, fontWeight: "500" }}>
-              {" "}· {KIND_DURATION[task.kind]}
-            </Text>
+          {/* PRIORITY badge — shown on high-priority undone tasks */}
+          {priority === "high" && !task.done && (
+            <View style={{
+              backgroundColor: kindColor + "1a",
+              borderWidth:     1,
+              borderColor:     kindColor + "30",
+              borderRadius:    4,
+              paddingHorizontal: 5,
+              paddingVertical:   1,
+            }}>
+              <Text style={{
+                color:         kindColor + "cc",
+                fontSize:      8,
+                fontWeight:    "900",
+                letterSpacing: 0.7,
+              }}>
+                PRIORITY
+              </Text>
+            </View>
           )}
-          <View style={{ flex: 1 }} />
-          <Text style={{
-            color: task.done ? "#28282e" : kindColor + "88",
-            fontSize: 9,
-            fontWeight: "800",
-            letterSpacing: 1,
-            marginRight: 4,
-          }}>
-            {task.kind.toUpperCase()}
-          </Text>
+          {!task.done && task.tag && (
+            <View style={{
+              backgroundColor: task.tag === "carried_over" ? "#1a1a2c" : "#0e1828",
+              borderRadius:    4,
+              paddingHorizontal: 5,
+              paddingVertical:   1,
+            }}>
+              <Text style={{
+                color:         task.tag === "carried_over" ? "#404068" : "#3060a0",
+                fontSize:      8,
+                fontWeight:    "800",
+                letterSpacing: 0.6,
+              }}>
+                {task.tag === "carried_over" ? "CARRIED" : "FOCUS"}
+              </Text>
+            </View>
+          )}
         </View>
       </View>
 
-      {/* Completion toggle — separate pressable so it doesn't open detail */}
+      {/* Circular completion toggle */}
       <Pressable
         onPress={(e) => { e.stopPropagation?.(); onToggle(); }}
-        hitSlop={{ top: 12, bottom: 12, left: 12, right: 0 }}
-        style={{ justifyContent: "center", paddingRight: 16, paddingLeft: 4 }}
+        hitSlop={{ top: 12, bottom: 12, left: 8, right: 4 }}
+        style={({ pressed }) => ({ flexShrink: 0, opacity: pressed ? 0.65 : 1 })}
       >
         <View style={{
-          width: 22,
-          height: 22,
-          borderRadius: 11,
-          borderWidth: 1.5,
-          borderColor: task.done ? "#66bb6a" : "#2e2e42",
-          backgroundColor: task.done ? "#66bb6a14" : "transparent",
-          alignItems: "center",
-          justifyContent: "center",
+          width:           26,
+          height:          26,
+          borderRadius:    13,
+          borderWidth:     task.done ? 0 : 1.5,
+          borderColor:     "#2a2a40",
+          backgroundColor: task.done ? "#66bb6a" : "transparent",
+          alignItems:      "center",
+          justifyContent:  "center",
+          ...(task.done ? {
+            shadowColor:   "#66bb6a",
+            shadowOpacity: 0.35,
+            shadowRadius:  8,
+            shadowOffset:  { width: 0, height: 0 },
+          } : {}),
         }}>
           {task.done && (
-            <Text style={{ color: "#66bb6a", fontSize: 11, fontWeight: "900", lineHeight: 14 }}>✓</Text>
+            <Text style={{ color: "#1a2e1a", fontSize: 12, fontWeight: "900", lineHeight: 14 }}>✓</Text>
           )}
         </View>
       </Pressable>
     </Pressable>
+    </Animated.View>
   );
 }
 
@@ -3027,22 +5186,164 @@ type ChatScreenProps = {
   rebalancedTasks:  TimedTask[];  // adapted + rebalanced — what Aira should prioritise
   recoveryStatus:   string;
   liveStreak:       number;
+  bestStreak:       number;
   score:            number;
   gamePlan:         GamePlan | null;
+  userContext:         string;
+  predictiveInsights: PredictiveInsight[];
+  nextBestAction:     NextAction | null;
+  winCondition:       WinCondition | null;
+  dayEvaluation:      DayEvaluation | null;
+  tomorrowPrep:       TomorrowPrep | null;
+  weeklyMomentum:     WeeklyMomentum | null;
+  saveTheDay:         SaveTheDay;
+  readinessState:     ReadinessState | null;
+  coachMode:          CoachMode;
+  memoryContext:      string;
+  onPlanAction:       (action: string) => void;
 };
 
 function ChatScreen({
   messages, setMessages, sessionId, setSessionId,
-  profile, recovery, blocks, tasks, rebalancedTasks, recoveryStatus, liveStreak, score, gamePlan,
+  profile, recovery, blocks, tasks, rebalancedTasks, recoveryStatus, liveStreak, bestStreak, score, gamePlan,
+  userContext, predictiveInsights, nextBestAction, winCondition, dayEvaluation, tomorrowPrep, weeklyMomentum, saveTheDay, readinessState, coachMode, memoryContext, onPlanAction,
 }: ChatScreenProps) {
-  const [chatInput,   setChatInput]   = useState("");
-  const [chatLoading, setChatLoading] = useState(false);
+  const [chatInput,     setChatInput]     = useState("");
+  const [chatLoading,   setChatLoading]   = useState(false);
+  const [checkinActive, setCheckinActive] = useState(false);
+  const [checkinStep,   setCheckinStep]   = useState(0);
+  const [checkinData,   setCheckinData]   = useState<Record<string, string>>({});
   const chatControllerRef = React.useRef<AbortController | null>(null);
   const scrollRef         = React.useRef<ScrollView>(null);
 
   const handleAskCoach = async (overrideText?: string) => {
     const trimmed = (overrideText ?? chatInput).trim();
     if (!trimmed || chatLoading) return;
+
+    // Day evaluation intercept — instant client-side answer, no API call
+    if (/how did i do (today)?\??$|how was my day\??$/i.test(trimmed) && dayEvaluation) {
+      const lines: string[] = [`**${dayEvaluation.status}** — ${dayEvaluation.message}`];
+      if (dayEvaluation.focusTomorrow) lines.push(`Tomorrow: ${dayEvaluation.focusTomorrow}`);
+      setMessages((prev) => [
+        ...prev,
+        { role: "user", content: trimmed },
+        { role: "assistant", content: lines.join("\n\n") },
+      ]);
+      setChatInput("");
+      return;
+    }
+
+    // Weekly momentum intercept — instant client-side answer, no API call
+    if (/how is my week (going)?\??|am i building momentum\??|how.s my week\??/i.test(trimmed) && weeklyMomentum) {
+      const lines = [
+        `**${weeklyMomentum.status}** — ${weeklyMomentum.summary}`,
+        weeklyMomentum.focus,
+      ];
+      setMessages((prev) => [
+        ...prev,
+        { role: "user", content: trimmed },
+        { role: "assistant", content: lines.join("\n\n") },
+      ]);
+      setChatInput("");
+      return;
+    }
+
+    // Tomorrow prep intercept — instant client-side answer, no API call
+    if (/what should i focus on tomorrow\??|how do i bounce back tomorrow\??|what.s my focus tomorrow\??/i.test(trimmed) && tomorrowPrep) {
+      const lines: string[] = [`**${tomorrowPrep.primaryFocus}**`];
+      if (tomorrowPrep.prepAction) lines.push(`Tonight: ${tomorrowPrep.prepAction}`);
+      if (tomorrowPrep.carryOverReason) lines.push(tomorrowPrep.carryOverReason);
+      setMessages((prev) => [
+        ...prev,
+        { role: "user", content: trimmed },
+        { role: "assistant", content: lines.join("\n\n") },
+      ]);
+      setChatInput("");
+      return;
+    }
+
+    // Readiness intercept — instant client-side answer, no API call
+    if (/what kind of day (is this|am i having)\??|how should i approach today\??|what.s my readiness\??/i.test(trimmed) && readinessState) {
+      const levelLabel =
+        readinessState.readiness === "PUSH"    ? "Push day"    :
+        readinessState.readiness === "RECOVER" ? "Recover day" :
+        "Build day";
+      setMessages((prev) => [
+        ...prev,
+        { role: "user", content: trimmed },
+        {
+          role: "assistant",
+          content: `**${levelLabel}.** ${readinessState.reason}`,
+        },
+      ]);
+      setChatInput("");
+      return;
+    }
+
+    // Energy-aware intercept — instant adapt + client-side confirmation, no API call
+    if (/\bi.?m (tired|exhausted|drained|wiped)\b|low energy|not feeling it|no energy|feel rough/i.test(trimmed)) {
+      onPlanAction("LOW_ENERGY");
+      setMessages((prev) => [
+        ...prev,
+        { role: "user", content: trimmed },
+        {
+          role: "assistant",
+          content: "Got it — plan adjusted for low energy. Workout de-intensified, optional tasks cleared. What's your one thing right now?",
+        },
+      ]);
+      setChatInput("");
+      return;
+    }
+
+    // Save The Day intercept — instant client-side answer, no API call
+    if (/i.m (behind|off track|falling behind)|i haven.?t done (anything|nothing)|i.m losing (my )?streak/i.test(trimmed) && saveTheDay.trigger) {
+      setMessages((prev) => [
+        ...prev,
+        { role: "user", content: trimmed },
+        {
+          role: "assistant",
+          content: `**${saveTheDay.action}**\n\n${saveTheDay.reason}`,
+        },
+      ]);
+      setChatInput("");
+      return;
+    }
+
+    // Win condition intercept — instant client-side answer, no API call
+    if (/what (matters most|do i need to (get done|do)|should i focus on) today\??$/i.test(trimmed) && winCondition) {
+      const lines: string[] = [`**${winCondition.primary}**`];
+      if (winCondition.secondary) lines.push(winCondition.secondary);
+      if (winCondition.flex?.length) lines.push(`If time allows: ${winCondition.flex.join(", ")}.`);
+      setMessages((prev) => [
+        ...prev,
+        { role: "user", content: trimmed },
+        { role: "assistant", content: lines.join("\n\n") },
+      ]);
+      setChatInput("");
+      return;
+    }
+
+    // "What should I do now?" — instant client-side answer, no API call
+    if (/what should i do (now|right now|next)\??$/i.test(trimmed) && nextBestAction) {
+      setMessages((prev) => [
+        ...prev,
+        { role: "user", content: trimmed },
+        {
+          role: "assistant",
+          content: `**${nextBestAction.label}**\n\n${nextBestAction.reason}`,
+        },
+      ]);
+      setChatInput("");
+      return;
+    }
+
+    // Command detection — runs before AI call so plan updates feel instant
+    const command = detectCommand(trimmed);
+    if (command) {
+      onPlanAction(command.type);
+    } else if (trimmed.toLowerCase().includes("adjust my plan")) {
+      onPlanAction("adjust"); // legacy quick-reply fallback
+    }
 
     if (chatControllerRef.current) {
       console.log("[chat] Aborting previous in-flight request");
@@ -3079,21 +5380,18 @@ function ChatScreen({
         body: JSON.stringify({
           message: trimmed,
           sessionId: sessionId ?? undefined,
-          name:  profile?.name  ?? "User",
-          goal:  profile?.goal  ?? "Build discipline",
-          wake:  profile?.wake  ?? "",
-          sleep: profile?.sleep ?? "",
-          startingPoint: profile?.startingPoint
-            ? (startingPointLabels[profile.startingPoint] ?? profile.startingPoint)
+          name:  profile?.profile?.firstName  ?? "User",
+          goal:  profile?.goals?.goalLabel   ?? "Build discipline",
+          wake:  profile?.sleep?.wakeTime    ?? "",
+          sleep: profile?.sleep?.sleepTime   ?? "",
+          targetGoal:       profile?.derived?.targetGoal
+            ? (TARGET_GOAL_LABELS[profile.derived?.targetGoal] ?? profile.derived?.targetGoal ?? "")
             : "",
-          targetGoal: profile?.targetGoal
-            ? (TARGET_GOAL_LABELS[profile.targetGoal] ?? profile.targetGoal)
-            : "",
-          bodyFatDirection: profile?.bodyFatDirection ?? "",
-          experienceLevel:  profile?.experienceLevel  ?? "",
-          equipment:        profile?.equipment        ?? "",
-          workoutFrequency: profile?.workoutFrequency ?? "",
-          dailyTrainingTime:profile?.dailyTrainingTime ?? "",
+          bodyFatDirection: profile?.derived?.bodyFatDirection ?? "",
+          experienceLevel:  profile?.training?.experience      ?? "",
+          equipment:        profile?.derived?.equipment        ?? "",
+          workoutFrequency: profile?.derived?.workoutFrequency ?? "",
+          dailyTrainingTime:profile?.training?.sessionDuration  ?? "",
           checkIn: {
             energyLevel:      recovery.energyLevel      ?? null,
             soreness:         recovery.soreness         ?? null,
@@ -3112,10 +5410,17 @@ function ChatScreen({
             priority: t.priority ?? "medium",
           })),
           streak: liveStreak,
+          bestStreak,
+          identityLabel: getIdentityLabel(liveStreak).label,
+          ...(predictiveInsights.length > 0 ? {
+            predictiveContext: predictiveInsights.map((i) => `${i.label}: ${i.message}`).join(" | "),
+          } : {}),
           score,
           gamePlan: gamePlan
             ? { readiness: gamePlan.readiness, timeMode: gamePlan.timeMode, message: gamePlan.message }
             : null,
+          coachMode,
+          ...(memoryContext ? { memoryContext } : {}),
         }),
         signal: controller.signal,
       });
@@ -3172,12 +5477,48 @@ function ChatScreen({
     }
   };
 
-  const STARTER_PROMPTS = [
-    "What should I do today?",
-    "Adjust my workout",
-    "Help me stay disciplined",
-    "Build my day",
+  // ── Check-in flow steps ───────────────────────────────────────────────────
+  const CHECKIN_STEPS = [
+    { key: "energy",   label: "How's your energy today?",      options: ["Low", "Moderate", "High"] },
+    { key: "soreness", label: "Any soreness or tightness?",    options: ["Feeling fresh", "Mild", "Pretty sore"] },
+    { key: "time",     label: "How much time do you have?",    options: ["Under 30 min", "About an hour", "Full time"] },
+    { key: "focus",    label: "What's your main focus today?", options: ["Training", "Nutrition", "Recovery", "All of it"] },
   ];
+
+  // ── Quick reply pills (shown mid-conversation) ────────────────────────────
+  const QUICK_REPLIES = [
+    "What should I do now?",
+    "What's my priority right now?",
+    "Motivate me",
+    "Adjust my plan",
+    "I have less time",
+    "What am I missing?",
+  ];
+
+  // ── Context-aware starter prompts ─────────────────────────────────────────
+  const starterPrompts = React.useMemo(() => {
+    const done    = rebalancedTasks.filter((t) => t.done);
+    const high    = rebalancedTasks.filter((t) => !t.done && (t.priority ?? "medium") === "high");
+    const workout = rebalancedTasks.find((t) => t.kind === "Workout");
+
+    if (rebalancedTasks.length === 0) {
+      return ["Build my day", "What should I focus on?", "How does this work?", "Set my goals"];
+    }
+    if (done.length === rebalancedTasks.length) {
+      return liveStreak >= 5
+        ? ["You're not starting anymore — you're consistent now.", "Build tomorrow", "How did I do today?", "Keep me accountable"]
+        : ["How did I do today?", "What should I work on next?", "Build tomorrow", "Keep me accountable"];
+    }
+
+    const prompts: string[] = [];
+    if (liveStreak > 0 && done.length === 0) prompts.push("Don't let me break my streak");
+    if (workout && !workout.done) prompts.push("I haven't done my workout yet");
+    if (high.length > 0)          prompts.push("What should I focus on right now?");
+    prompts.push("I have less time today");
+    prompts.push(done.length === 0 ? "Motivate me to start" : "Keep the momentum going");
+    if (prompts.length < 4)       prompts.push("Adjust my plan");
+    return prompts.slice(0, 4);
+  }, [rebalancedTasks, liveStreak]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <KeyboardAvoidingView
@@ -3185,7 +5526,7 @@ function ChatScreen({
       behavior={Platform.OS === "ios" ? "padding" : undefined}
       keyboardVerticalOffset={90}
     >
-      {/* Message list */}
+      {/* ── Message list ──────────────────────────────────────────────────────── */}
       <ScrollView
         ref={scrollRef}
         style={{ flex: 1 }}
@@ -3193,140 +5534,372 @@ function ChatScreen({
         keyboardShouldPersistTaps="handled"
         onContentSizeChange={() => scrollRef.current?.scrollToEnd({ animated: true })}
       >
-        {/* Empty state — starter prompts */}
+
+        {/* ── Empty state ───────────────────────────────────────────────────── */}
         {messages.length === 0 && !chatLoading && (
-          <View style={{ gap: 16, paddingTop: 8 }}>
-            <View style={{ gap: 4 }}>
-              <Text style={styles.h2}>Aira</Text>
-              <Text style={styles.bodyMuted}>Your discipline coach. Ask anything.</Text>
+          <View style={{ gap: 22, paddingTop: 4 }}>
+
+            {/* Identity */}
+            <View style={{ gap: 5 }}>
+              <Text style={{ color: "#fff", fontSize: 28, fontWeight: "900", letterSpacing: -0.8 }}>Aira</Text>
+              <Text style={{ color: "#5050a0", fontSize: 9, fontWeight: "900", letterSpacing: 1.6 }}>YOUR COACH · ALWAYS ON</Text>
             </View>
-            <View style={{ gap: 8 }}>
-              {STARTER_PROMPTS.map((prompt) => (
-                <Pressable
-                  key={prompt}
-                  onPress={() => handleAskCoach(prompt)}
-                  style={{
-                    borderWidth: 1,
-                    borderColor: "#262626",
-                    borderRadius: 12,
-                    padding: 14,
-                    backgroundColor: "#0a0a0a",
-                  }}
-                >
-                  <Text style={{ color: "#bdbdbd", fontSize: 14 }}>{prompt}</Text>
-                </Pressable>
-              ))}
+
+            {/* Context strip — shows what Aira already knows */}
+            {rebalancedTasks.length > 0 && (
+              <View style={{
+                backgroundColor: "#0a0a18",
+                borderWidth: 1,
+                borderColor: "#1e1e38",
+                borderRadius: 16,
+                padding: 16,
+                gap: 12,
+              }}>
+                <Text style={{ color: "#404068", fontSize: 9, fontWeight: "900", letterSpacing: 1.2 }}>
+                  AIRA KNOWS YOUR DAY
+                </Text>
+
+                {/* Stats row */}
+                <View style={{ flexDirection: "row", gap: 20 }}>
+                  <View style={{ gap: 3 }}>
+                    <Text style={{ color: score > 0 ? "#fff" : "#444", fontSize: 20, fontWeight: "900", letterSpacing: -0.8 }}>
+                      {score}
+                    </Text>
+                    <Text style={{ color: "#333350", fontSize: 9, fontWeight: "700", letterSpacing: 0.8 }}>SCORE</Text>
+                  </View>
+                  <View style={{ gap: 3 }}>
+                    <Text style={{ color: rebalancedTasks.filter((t) => t.done).length > 0 ? "#66bb6a" : "#444", fontSize: 20, fontWeight: "900", letterSpacing: -0.8 }}>
+                      {rebalancedTasks.filter((t) => t.done).length}/{rebalancedTasks.length}
+                    </Text>
+                    <Text style={{ color: "#333350", fontSize: 9, fontWeight: "700", letterSpacing: 0.8 }}>TASKS DONE</Text>
+                  </View>
+                  {liveStreak > 0 && (
+                    <View style={{ gap: 3 }}>
+                      <Text style={{ color: ACCENT, fontSize: 20, fontWeight: "900", letterSpacing: -0.8 }}>{liveStreak}</Text>
+                      <Text style={{ color: "#333350", fontSize: 9, fontWeight: "700", letterSpacing: 0.8 }}>STREAK</Text>
+                    </View>
+                  )}
+                  {bestStreak > 0 && liveStreak < bestStreak && (
+                    <View style={{ gap: 3 }}>
+                      <Text style={{ color: "#555580", fontSize: 20, fontWeight: "900", letterSpacing: -0.8 }}>{bestStreak}</Text>
+                      <Text style={{ color: "#333350", fontSize: 9, fontWeight: "700", letterSpacing: 0.8 }}>BEST</Text>
+                    </View>
+                  )}
+                  {/* Identity label */}
+                  {(() => {
+                    const { label, color } = getIdentityLabel(liveStreak);
+                    return (
+                      <View style={{ gap: 3 }}>
+                        <Text style={{ color, fontSize: 11, fontWeight: "900", letterSpacing: -0.3 }}>{label}</Text>
+                        <Text style={{ color: "#333350", fontSize: 9, fontWeight: "700", letterSpacing: 0.8 }}>IDENTITY</Text>
+                      </View>
+                    );
+                  })()}
+                  {gamePlan && (
+                    <View style={{ flex: 1, alignItems: "flex-end", justifyContent: "flex-start", paddingTop: 2 }}>
+                      <View style={{ backgroundColor: gamePlan.color + "18", borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3 }}>
+                        <Text style={{ color: gamePlan.color, fontSize: 9, fontWeight: "900", letterSpacing: 0.8 }}>
+                          {gamePlan.readiness.toUpperCase()}
+                        </Text>
+                      </View>
+                    </View>
+                  )}
+                </View>
+
+                {/* Pending high-priority tasks */}
+                {(() => {
+                  const missedHigh = rebalancedTasks.filter((t) => !t.done && (t.priority ?? "medium") === "high");
+                  if (missedHigh.length === 0) return null;
+                  return (
+                    <View style={{ borderTopWidth: 1, borderTopColor: "#141428", paddingTop: 10, gap: 5 }}>
+                      {missedHigh.slice(0, 2).map((t) => (
+                        <Text key={t.id} style={{ color: "#5050a0", fontSize: 11, fontWeight: "600", lineHeight: 16 }}>
+                          · {t.title}
+                        </Text>
+                      ))}
+                      {missedHigh.length > 2 && (
+                        <Text style={{ color: "#333350", fontSize: 11, fontWeight: "600" }}>
+                          +{missedHigh.length - 2} more pending
+                        </Text>
+                      )}
+                    </View>
+                  );
+                })()}
+
+                {/* Streak nudge line */}
+                {(() => {
+                  const doneTasks = rebalancedTasks.filter((t) => t.done);
+                  if (liveStreak > 0 && doneTasks.length === 0) {
+                    return (
+                      <View style={{ borderTopWidth: 1, borderTopColor: "#141428", paddingTop: 10 }}>
+                        <Text style={{ color: "#7744aa", fontSize: 11, fontWeight: "700" }}>
+                          Don&apos;t break your {liveStreak}-day streak today.
+                        </Text>
+                      </View>
+                    );
+                  }
+                  if (bestStreak > liveStreak && bestStreak - liveStreak <= 3 && liveStreak > 0) {
+                    return (
+                      <View style={{ borderTopWidth: 1, borderTopColor: "#141428", paddingTop: 10 }}>
+                        <Text style={{ color: "#6060a0", fontSize: 11, fontWeight: "600" }}>
+                          {bestStreak - liveStreak} day{bestStreak - liveStreak !== 1 ? "s" : ""} from your best streak ({bestStreak}).
+                        </Text>
+                      </View>
+                    );
+                  }
+                  return null;
+                })()}
+              </View>
+            )}
+
+            {/* Starter prompts */}
+            <View style={{ gap: 10 }}>
+              <Text style={{ color: "#383858", fontSize: 9, fontWeight: "900", letterSpacing: 1.2 }}>QUICK START</Text>
+              <View style={{ gap: 7 }}>
+                {starterPrompts.map((prompt) => (
+                  <Pressable
+                    key={prompt}
+                    onPress={() => {
+                      if (prompt === "Build my day") {
+                        setCheckinActive(true);
+                        setCheckinStep(0);
+                        setCheckinData({});
+                      } else {
+                        handleAskCoach(prompt);
+                      }
+                    }}
+                    style={{
+                      borderWidth: 1,
+                      borderColor: "#1a1a2e",
+                      borderRadius: 13,
+                      paddingVertical: 13,
+                      paddingHorizontal: 15,
+                      backgroundColor: "#09091a",
+                      flexDirection: "row",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                    }}
+                  >
+                    <Text style={{ color: "#c8c8e0", fontSize: 14, fontWeight: "600" }}>{prompt}</Text>
+                    <Text style={{ color: ACCENT + "60", fontSize: 16, fontWeight: "700" }}>›</Text>
+                  </Pressable>
+                ))}
+              </View>
             </View>
+
           </View>
         )}
 
-        {/* Messages */}
+        {/* ── Messages ──────────────────────────────────────────────────────── */}
         {messages.map((msg, i) => (
           <View
             key={i}
-            style={{ alignSelf: msg.role === "user" ? "flex-end" : "flex-start", maxWidth: "85%", gap: 4 }}
+            style={{ alignSelf: msg.role === "user" ? "flex-end" : "flex-start", maxWidth: "88%", gap: 4 }}
           >
             {msg.role === "assistant" && (
-              <Text style={{ color: ACCENT, fontSize: 10, fontWeight: "800", letterSpacing: 0.5 }}>
-                AIRA
-              </Text>
+              <Text style={{ color: ACCENT, fontSize: 9, fontWeight: "900", letterSpacing: 1.2 }}>AIRA</Text>
             )}
             <View
               style={{
-                backgroundColor: msg.role === "user" ? ACCENT : "#0f0f0f",
+                backgroundColor: msg.role === "user" ? ACCENT : "#0d0d1a",
                 borderWidth: 1,
-                borderColor: msg.role === "user" ? ACCENT : "#1e1e1e",
+                borderColor: msg.role === "user" ? ACCENT : "#1e1e30",
                 borderRadius: 14,
                 borderTopRightRadius: msg.role === "user" ? 4 : 14,
                 borderTopLeftRadius: msg.role === "assistant" ? 4 : 14,
-                padding: 12,
+                padding: 13,
               }}
             >
-              <Text style={{ color: "#fff", fontSize: 14, lineHeight: 21 }}>
+              <Text style={{
+                color: "#f0f0f8",
+                fontSize: 14,
+                lineHeight: 22,
+                fontWeight: msg.role === "assistant" ? "500" : "600",
+              }}>
                 {msg.content}
               </Text>
             </View>
           </View>
         ))}
 
-        {/* Loading bubble */}
+        {/* ── Typing indicator ──────────────────────────────────────────────── */}
         {chatLoading && (
           <View style={{ alignSelf: "flex-start", maxWidth: "85%", gap: 4 }}>
-            <Text style={{ color: ACCENT, fontSize: 10, fontWeight: "800", letterSpacing: 0.5 }}>
-              AIRA
-            </Text>
-            <View
-              style={{
-                backgroundColor: "#0f0f0f",
-                borderWidth: 1,
-                borderColor: "#1e1e1e",
-                borderRadius: 14,
-                borderTopLeftRadius: 4,
-                padding: 12,
-              }}
-            >
-              <Text style={{ color: "#555", fontSize: 14 }}>Thinking…</Text>
+            <Text style={{ color: ACCENT, fontSize: 9, fontWeight: "900", letterSpacing: 1.2 }}>AIRA</Text>
+            <View style={{
+              backgroundColor: "#0d0d1a",
+              borderWidth: 1,
+              borderColor: "#1e1e30",
+              borderRadius: 14,
+              borderTopLeftRadius: 4,
+              padding: 13,
+            }}>
+              <Text style={{ color: "#404060", fontSize: 14 }}>Coaching…</Text>
             </View>
           </View>
         )}
+
       </ScrollView>
 
-      {/* Input bar */}
-      <View
-        style={{
+      {/* ── Check-in flow ─────────────────────────────────────────────────────── */}
+      {checkinActive && (
+        <View style={{
+          backgroundColor: "#070710",
+          borderTopWidth: 1,
+          borderTopColor: ACCENT + "30",
+          padding: 18,
+          gap: 16,
+        }}>
+          <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+              <Text style={{ color: ACCENT, fontSize: 9, fontWeight: "900", letterSpacing: 1.2 }}>CHECK-IN</Text>
+              <View style={{ flexDirection: "row", gap: 4 }}>
+                {CHECKIN_STEPS.map((_, idx) => (
+                  <View key={idx} style={{
+                    width: 16,
+                    height: 3,
+                    borderRadius: 2,
+                    backgroundColor: idx <= checkinStep ? ACCENT : "#1e1e30",
+                  }} />
+                ))}
+              </View>
+            </View>
+            <Pressable
+              onPress={() => setCheckinActive(false)}
+              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+            >
+              <Text style={{ color: "#3a3a5a", fontSize: 12, fontWeight: "700" }}>Cancel</Text>
+            </Pressable>
+          </View>
+
+          <Text style={{ color: "#e8e8f4", fontSize: 16, fontWeight: "700", letterSpacing: -0.3 }}>
+            {CHECKIN_STEPS[checkinStep].label}
+          </Text>
+
+          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+            {CHECKIN_STEPS[checkinStep].options.map((opt) => (
+              <Pressable
+                key={opt}
+                onPress={() => {
+                  const newData = { ...checkinData, [CHECKIN_STEPS[checkinStep].key]: opt };
+                  setCheckinData(newData);
+                  if (checkinStep < CHECKIN_STEPS.length - 1) {
+                    setCheckinStep(checkinStep + 1);
+                  } else {
+                    setCheckinActive(false);
+                    const summary = CHECKIN_STEPS
+                      .map((s) => `${s.key}: ${newData[s.key]}`)
+                      .join(", ");
+                    handleAskCoach(`Check-in — ${summary}. Based on this, what should I do today? Be direct and specific.`);
+                  }
+                }}
+                style={{
+                  backgroundColor: "#0e0e1e",
+                  borderWidth: 1,
+                  borderColor: ACCENT + "40",
+                  borderRadius: 10,
+                  paddingVertical: 11,
+                  paddingHorizontal: 18,
+                }}
+              >
+                <Text style={{ color: "#c8c8e8", fontSize: 14, fontWeight: "700" }}>{opt}</Text>
+              </Pressable>
+            ))}
+          </View>
+        </View>
+      )}
+
+      {/* ── Quick reply pills — always visible so the user can always take action ── */}
+      {!checkinActive && !chatLoading && (
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          style={{ flexGrow: 0, borderTopWidth: 1, borderTopColor: "#111118" }}
+          contentContainerStyle={{ paddingHorizontal: 14, paddingVertical: 9, gap: 7 }}
+        >
+          {QUICK_REPLIES.map((q) => (
+            <Pressable
+              key={q}
+              onPress={() => handleAskCoach(q)}
+              style={{
+                backgroundColor: "#0a0a16",
+                borderWidth: 1,
+                borderColor: "#1e1e30",
+                borderRadius: 20,
+                paddingVertical: 7,
+                paddingHorizontal: 14,
+              }}
+            >
+              <Text style={{ color: "#8080a8", fontSize: 12, fontWeight: "700" }}>{q}</Text>
+            </Pressable>
+          ))}
+        </ScrollView>
+      )}
+
+      {/* ── Input bar ─────────────────────────────────────────────────────────── */}
+      {!checkinActive && (
+        <View style={{
           flexDirection: "row",
           alignItems: "flex-end",
           gap: 10,
           padding: 12,
           borderTopWidth: 1,
-          borderTopColor: "#1e1e1e",
+          borderTopColor: "#141420",
           backgroundColor: "#000",
-        }}
-      >
-        <TextInput
-          value={chatInput}
-          onChangeText={setChatInput}
-          onSubmitEditing={() => handleAskCoach()}
-          returnKeyType="send"
-          placeholder="Message Aira…"
-          placeholderTextColor="#555"
-          multiline
-          style={{
-            flex: 1,
-            backgroundColor: "#0f0f0f",
-            borderWidth: 1,
-            borderColor: "#262626",
-            borderRadius: 12,
-            paddingHorizontal: 14,
-            paddingVertical: 10,
-            color: "#fff",
-            fontSize: 14,
-            maxHeight: 100,
-          }}
-        />
-        <Pressable
-          onPress={() => handleAskCoach()}
-          disabled={chatLoading || !chatInput.trim()}
-          style={{
-            backgroundColor: chatLoading || !chatInput.trim() ? "#1a1a1a" : ACCENT,
-            borderRadius: 12,
-            paddingHorizontal: 18,
-            paddingVertical: 12,
-            justifyContent: "center",
-            alignItems: "center",
-          }}
-        >
-          <Text
+        }}>
+          <TextInput
+            value={chatInput}
+            onChangeText={setChatInput}
+            onSubmitEditing={() => handleAskCoach()}
+            returnKeyType="send"
+            placeholder="Ask your coach…"
+            placeholderTextColor="#333350"
+            multiline
             style={{
-              color: chatLoading || !chatInput.trim() ? "#444" : "#fff",
-              fontWeight: "800",
+              flex: 1,
+              backgroundColor: "#0a0a14",
+              borderWidth: 1,
+              borderColor: chatInput.trim() ? "#28283e" : "#1a1a28",
+              borderRadius: 14,
+              paddingHorizontal: 14,
+              paddingVertical: 10,
+              color: "#f0f0f8",
               fontSize: 14,
+              maxHeight: 100,
+            }}
+          />
+          <Pressable
+            onPress={() => handleAskCoach()}
+            disabled={chatLoading || !chatInput.trim()}
+            style={{
+              backgroundColor: chatLoading || !chatInput.trim() ? "#0a0a14" : ACCENT,
+              borderRadius: 14,
+              paddingHorizontal: 18,
+              paddingVertical: 12,
+              justifyContent: "center",
+              alignItems: "center",
+              borderWidth: 1,
+              borderColor: chatLoading || !chatInput.trim() ? "#1a1a28" : ACCENT,
+              ...(chatInput.trim() && !chatLoading ? {
+                shadowColor: ACCENT,
+                shadowOpacity: 0.28,
+                shadowRadius: 10,
+                shadowOffset: { width: 0, height: 3 },
+                elevation: 4,
+              } : {}),
             }}
           >
-            Send
-          </Text>
-        </Pressable>
-      </View>
+            <Text style={{
+              color: chatLoading || !chatInput.trim() ? "#2a2a40" : "#fff",
+              fontWeight: "800",
+              fontSize: 14,
+            }}>
+              Send
+            </Text>
+          </Pressable>
+        </View>
+      )}
+
     </KeyboardAvoidingView>
   );
 }
@@ -3336,6 +5909,15 @@ export default function Index() {
   // auth
   const [authUser, setAuthUser]       = useState<AuthUser | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
+  // Splash transition — true once the Splash fade-out animation finishes
+  const [splashDone, setSplashDone]   = useState(false);
+  // Minimum splash display time — prevents instant-exit on fast devices
+  const [minTimePassed, setMinTimePassed] = useState(false);
+
+  useEffect(() => {
+    const t = setTimeout(() => setMinTimePassed(true), 5000);
+    return () => clearTimeout(t);
+  }, []);
 
   useEffect(() => {
     // Read stored session from AsyncStorage (and silently refresh if expiring).
@@ -3357,8 +5939,11 @@ export default function Index() {
 
   // profile/auth
   const [authed, setAuthed] = useState(false);
-  const [tab, setTab] = useState<TabKey>("Today");
+  const [tab, setTab] = useState<TabKey>("Home");
+  // "settings" or "schedule" overlays — shown in place of tab content, tab bar stays visible
+  const [overlay, setOverlay] = useState<"settings" | "schedule" | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
+  const [generatedPlan, setGeneratedPlan] = useState<GeneratedDailyPlan | null>(null);
 
   // routine
   const [blocks, setBlocks] = useState<ScheduleBlock[]>([]);
@@ -3380,6 +5965,23 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
   const [recovery, setRecovery] = useState<RecoveryData>({ date: "", energyLevel: null });
   const [gamePlan, setGamePlan] = useState<GamePlan | null>(null);
 
+  // Program Brain — multi-day plan structure (foundation layer)
+  const [programPlan, setProgramPlan] = useState<ProgramPlan | null>(null);
+
+  // Current program day — single source of truth, recalculated whenever the plan changes
+  const currentDayIndex = useMemo(() => {
+    const idx = getCurrentProgramDayIndex(programPlan);
+    if (__DEV__ && programPlan) {
+      console.log(
+        `[program] generatedDate=${programPlan.generatedDate}`,
+        `today=${new Date().toISOString().slice(0, 10)}`,
+        `dayIndex=${idx}`,
+        `days available=[${programPlan.days.map((d) => d.dayIndex).join(",")}]`,
+      );
+    }
+    return idx;
+  }, [programPlan]);
+
   // task feedback — tracks high-priority task outcomes for the current day
   const [taskFeedback, setTaskFeedback] = useState<TaskFeedbackMap>({});
 
@@ -3389,6 +5991,8 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
   const visibleTasks    = useMemo(() => adaptTasksForPlan(tasks, gamePlan),                   [tasks, gamePlan]);
   const rebalancedTasks = useMemo(() => rebalanceTasks(visibleTasks, taskFeedback, gamePlan), [visibleTasks, taskFeedback, gamePlan]);
   const score           = useMemo(() => calcScore(rebalancedTasks),                           [rebalancedTasks]);
+  // Index-level done count — needed for predictive insights without entering Today() scope
+  const todayDoneCount  = useMemo(() => rebalancedTasks.filter((t) => t.done).length,         [rebalancedTasks]);
 
   // AI planner — plan metadata; tasks live in the existing `tasks` state
   const [aiPlan,        setAiPlan]        = useState<AIPlan | null>(null);
@@ -3404,6 +6008,44 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
 
   // day-log history (last 30 days of scores)
   const [history, setHistory] = useState<DayLog[]>([]);
+
+  // Cumulative behavior patterns — updated on every task toggle, persisted across sessions
+  const [behaviorPatterns, setBehaviorPatterns] = useState<BehaviorPatterns>(emptyPatterns());
+
+  // Transient reinforcement message shown after a task toggle (auto-clears after 3s)
+  const [completionMsg, setCompletionMsg] = useState<string | null>(null);
+  const completionMsgTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Adaptive Day Engine — local overlay on top of the AI plan
+  const [adaptedTasks,         setAdaptedTasks]         = useState<TimedTask[] | null>(null);
+  const [adaptBanner,          setAdaptBanner]           = useState<AdaptResult | null>(null);
+  const adaptBannerTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  // In-day rebalance — silent background compression (lower priority than adaptedTasks)
+  const [inDayRebalancedTasks, setInDayRebalancedTasks] = useState<TimedTask[] | null>(null);
+  // System nudge — one-line message shown when the system silently adjusts the plan
+  const [systemNudge,          setSystemNudge]           = useState<string | null>(null);
+  const systemNudgeTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Schedule-aware plan note — shown after plan generation if blocks exist
+  const [schedulePlanNote, setSchedulePlanNote] = useState<string | null>(null);
+
+  // Friction removal — inactivity nudge on Today tab
+  const [showStartNudge, setShowStartNudge] = useState(false);
+  const inactivityTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Command system — plan lock + auto-dismissing confirmation banner
+  const [planLocked,     setPlanLocked]     = useState(false);
+  const [commandBanner,  setCommandBanner]  = useState<string | null>(null);
+  const commandBannerTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Auto-Pilot: per-session flags — each condition fires at most once per session
+  const [hasMiddayAdjusted,   setHasMiddayAdjusted]   = useState(false);
+  const [hasWorkoutRecovered, setHasWorkoutRecovered] = useState(false);
+  const [hasDayRecovered,     setHasDayRecovered]     = useState(false);
+
+  // Save The Day — dismissed by user or auto-cleared when a task is completed
+  const [saveTheDayDismissed, setSaveTheDayDismissed] = useState(false);
+
   const historyLastScoreRef   = React.useRef<number | null>(null);
   const historyLastDateRef    = React.useRef<string>("");
 
@@ -3447,25 +6089,11 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
     setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, done: !t.done } : t)));
   };
 
-  // Onboarding fields
-  const [name, setName] = useState("");
-  const [goal, setGoal] = useState("Model Build (Lean + Athletic)");
-  const [wake, setWake] = useState("7:00 AM");
-  const [sleep, setSleep] = useState("11:00 PM");
-  const [onboardingStep, setOnboardingStep] = useState<1 | 2 | 3 | 4 | 5>(1);
-  const [startingPoint, setStartingPoint]   = useState("");
-  const [targetGoal, setTargetGoal]         = useState("");
-  const [bodyFatDirection, setBodyFatDirection] = useState("");
-  const [experienceLevel, setExperienceLevel]   = useState("");
-  const [equipment, setEquipment]               = useState("");
-  const [workoutFrequency, setWorkoutFrequency] = useState("");
-  const [dailyTrainingTime, setDailyTrainingTime] = useState("");
-
   // Load persisted data once on mount
   useEffect(() => {
     (async () => {
       try {
-        const [profileRaw, blocksRaw, tasksRaw, chatRaw, motivationDateRaw, streakRaw, recoveryRaw, historyRaw, feedbackRaw] = await Promise.all([
+        const [profileRaw, blocksRaw, tasksRaw, chatRaw, motivationDateRaw, streakRaw, recoveryRaw, historyRaw, feedbackRaw, patternsRaw, programPlanRaw, generatedPlanRaw, aiPlanRaw] = await Promise.all([
           AsyncStorage.getItem(STORE.profile),
           AsyncStorage.getItem(STORE.blocks),
           AsyncStorage.getItem(STORE.tasks),
@@ -3475,10 +6103,23 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
           AsyncStorage.getItem(STORE.recovery),
           AsyncStorage.getItem(STORE.history),
           AsyncStorage.getItem(STORE.feedback),
+          AsyncStorage.getItem(STORE.patterns),
+          AsyncStorage.getItem(STORE.programPlan),
+          AsyncStorage.getItem(STORE.generatedPlan),
+          AsyncStorage.getItem(STORE.aiPlan),
         ]);
         if (profileRaw) {
-          setProfile(JSON.parse(profileRaw) as Profile);
-          setAuthed(true);
+          // Normalize before storing in state — handles old flat or partial shapes
+          // from AsyncStorage without crashing downstream plan generation.
+          const rawParsed  = JSON.parse(profileRaw);
+          const normalized = normalizeProfileForPlanning(rawParsed);
+          if (normalized) {
+            setProfile(normalized);
+            setAuthed(true);
+          } else {
+            // Profile exists but is too incomplete to use — treat as unauthenticated
+            console.warn("[storage] Profile loaded but missing required fields — treating as unauthenticated");
+          }
 
           // Show motivation once per calendar day
           const today = new Date().toISOString().slice(0, 10);
@@ -3513,6 +6154,17 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
           );
           if (Object.keys(todayOnly).length > 0) setTaskFeedback(todayOnly);
         }
+        if (patternsRaw) setBehaviorPatterns(JSON.parse(patternsRaw) as BehaviorPatterns);
+        if (programPlanRaw) setProgramPlan(JSON.parse(programPlanRaw) as ProgramPlan);
+        if (aiPlanRaw) {
+          // Prefer the directly-stored AIPlan from the local Aira bridge path.
+          setAiPlan(JSON.parse(aiPlanRaw) as AIPlan);
+        } else if (generatedPlanRaw) {
+          // Backward compat: restore from old GeneratedDailyPlan format.
+          const gp = JSON.parse(generatedPlanRaw) as GeneratedDailyPlan;
+          setGeneratedPlan(gp);
+          setAiPlan(synthesizeAIPlan(gp));
+        }
       } catch (e) {
         console.warn("[storage] Load failed:", e);
       } finally {
@@ -3527,19 +6179,35 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
   const aiTaskToTimedTask = (t: {
     id: string; timeText: string; title: string;
     kind: string; priority: string; done: boolean;
+    exercises?: AIWorkoutExercise[];
   }): TimedTask => ({
-    id:       t.id,
-    timeMin:  parseTimeToMinutes(t.timeText) ?? 480, // default 8 AM if parse fails
-    timeText: t.timeText,
-    title:    t.title,
-    kind:     t.kind     as TaskKind,
-    priority: t.priority as TaskPriority,
-    done:     t.done,
+    id:        t.id,
+    timeMin:   parseTimeToMinutes(t.timeText) ?? 480, // default 8 AM if parse fails
+    timeText:  t.timeText,
+    title:     t.title,
+    kind:      t.kind     as TaskKind,
+    priority:  t.priority as TaskPriority,
+    done:      t.done,
+    // Carry AI exercises into the task so WorkoutDetailModal can render them
+    ...(t.exercises && t.exercises.length > 0 ? { exercises: t.exercises } : {}),
   });
 
   /**
-   * Silently fetch today's plan on app open.
-   * If no plan exists the app stays in the manual-plan state — no error shown.
+   * Legacy server fetch — kept for backward compatibility only.
+   *
+   * Since Phase 7, plan generation runs entirely through the local Aira Intelligence
+   * bridge (generateLocalAiraPlan). Plans are never POSTed to the server, so this
+   * GET will return 404 for all users going forward and acts as a no-op.
+   *
+   * Execution order at startup:
+   *   1. Local AsyncStorage restore (dc:ai_plan / dc:tasks) — runs on mount.
+   *   2. Supabase user data load — runs in the auth useEffect.
+   *   3. THIS CALL — runs last, after both of the above.
+   *
+   * If the server somehow did return a plan (e.g. a manually-inserted row), it would
+   * overwrite the locally-restored Aira plan. This does NOT happen in practice.
+   *
+   * Do not remove until the server planner route is formally deprecated.
    */
   const fetchTodayAIPlan = async (userId: string) => {
     const date = new Date().toISOString().slice(0, 10);
@@ -3580,83 +6248,524 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
    * Generate (or regenerate) today's AI plan.
    * Validates + stores on the backend, then hydrates local state.
    */
-  const generateAIPlan = async () => {
+  const generateAIPlan = async (
+    conditionOverride?: RecoveryData,
+    gamePlanOverride?: GamePlan | null,
+  ) => {
     if (!authUser || !profile) return;
+
+    // Normalize before any nested access — guards against old AsyncStorage shapes
+    const safeProfile = normalizeProfileForPlanning(profile);
+    if (!safeProfile) {
+      console.warn("[planner] generateAIPlan: profile missing required fields (sleep times), skipping");
+      setAiPlanError("Profile incomplete — please update your sleep schedule in Settings.");
+      return;
+    }
+
+    const cond = conditionOverride ?? recovery;
     setAiPlanLoading(true);
     setAiPlanError(null);
-    console.log("[planner] generateAIPlan start — userId:", authUser.id.slice(0, 8) + "…");
+    setSchedulePlanNote(null); // clear previous note while regenerating
+    console.log("[planner] generateAIPlan (local intelligence) start");
     try {
-      const res = await fetch(`${API_BASE_URL}/api/planner/generate`, {
-        method:  "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          userId:  authUser.id,
-          profile,
-          schedule: {
-            blocks: blocks.map((b) => ({
-              title: b.title, type: b.type, start: b.startText, end: b.endText,
-            })),
-          },
-          condition: {
-            energyLevel:     recovery.energyLevel,
-            soreness:        recovery.soreness,
-            motivationLevel: recovery.motivationLevel,
-            timeAvailable:   recovery.timeAvailable,
-            focusArea:       recovery.focusArea,
-          },
-          behavior: {
-            streak: liveStreak,
-            score,
-            taskFeedback: Object.values(taskFeedback),
-          },
-          context: {
-            date:     new Date().toISOString().slice(0, 10),
-            gamePlan: gamePlan
-              ? { readiness: gamePlan.readiness, timeMode: gamePlan.timeMode, message: gamePlan.message }
-              : null,
-          },
-        }),
+      // ── Local Aira Intelligence System ──────────────────────────────────────
+      // Replaces the old POST /api/planner/generate server call.
+      // Synchronous + deterministic — no network I/O, no randomness.
+      // NOTE: set DEV_MOCK_ENABLED = false to test this path in development.
+      const { aiPlan: newAiPlan, tasks: newTasks } = generateLocalAiraPlan(safeProfile, cond ?? undefined);
+
+      setAiPlan(newAiPlan);
+      AsyncStorage.setItem(STORE.aiPlan, JSON.stringify(newAiPlan)).catch(console.warn);
+      setSchedulePlanNote(getScheduleNote(blocks));
+      // New local plan supersedes any local rule-based adaptation
+      setAdaptedTasks(null);
+      setAdaptBanner(null);
+      setInDayRebalancedTasks(null);
+      setSystemNudge(null);
+
+      // Register as a single-day program; preserve forward-adjusted future days
+      const today = new Date().toISOString().slice(0, 10);
+      const day0: ProgramDay = { dayIndex: 0, tasks: newTasks };
+      setTasks(newTasks);
+      setProgramPlan((prev) => {
+        const preserved = prev && prev.generatedDate === today
+          ? prev.days.filter((d) => d.dayIndex !== 0)
+          : [];
+        return {
+          generatedDate: today,
+          days: [day0, ...preserved].sort((a, b) => a.dayIndex - b.dayIndex),
+        };
       });
 
-      // Parse JSON defensively — a non-JSON body (e.g. HTML 404 from a proxy or cold-start
-      // error page) would throw here and obscure the real HTTP status code.
-      let data: Record<string, unknown>;
-      try {
-        data = await res.json();
-      } catch {
-        console.error("[planner] generate: server returned non-JSON response, status:", res.status);
-        setAiPlanError(`Server error (${res.status}) — please try again.`);
-        return;
-      }
-
-      if (!res.ok) {
-        const msg = (data.error as string | undefined) ?? `Request failed (${res.status}).`;
-        console.error("[planner] generate: server error:", res.status, msg, data.details ?? "");
-        setAiPlanError(msg);
-        return;
-      }
-
-      console.log("[planner] generate success — tasks:", (data.tasks as unknown[])?.length ?? 0);
-      setAiPlan(data.plan as AIPlan);
-      if (Array.isArray(data.tasks) && data.tasks.length) {
-        setTasks(
-          (data.tasks as any[])
-            .map(aiTaskToTimedTask)
-            .sort((a: { timeMin: number }, b: { timeMin: number }) => a.timeMin - b.timeMin)
-        );
-      }
+      console.log("[planner] generateAIPlan (local) success — tasks:", newTasks.length);
     } catch (err) {
-      console.error("[planner] generate network error:", err);
-      setAiPlanError("Network error — check your connection and try again.");
+      console.error("[planner] generateAIPlan (local) error:", err);
+      if (err instanceof AiraIntelligenceError) {
+        setAiPlanError(`Plan generation failed (${err.code}) — try again.`);
+      } else {
+        setAiPlanError("Plan generation failed — please try again.");
+      }
     } finally {
       setAiPlanLoading(false);
     }
   };
 
+  // Derived pattern insights — requires at least a few data points to avoid noise
+  const patternInsights = useMemo(() => {
+    const { kindDone, kindUndone, workoutSlots } = behaviorPatterns;
+
+    // Preferred workout time: slot with the most completions (min 2 to be meaningful)
+    const slotEntries = [
+      { slot: "morning"   as const, count: workoutSlots.morning },
+      { slot: "afternoon" as const, count: workoutSlots.afternoon },
+      { slot: "evening"   as const, count: workoutSlots.evening },
+    ];
+    const topSlot = [...slotEntries].sort((a, b) => b.count - a.count)[0];
+    const preferredWorkoutTime = topSlot.count >= 2 ? topSlot.slot : null;
+
+    // Most unreliable kind: highest uncheck count (proxy for skipping), min 2
+    let mostSkippedKind: TaskKind | null = null;
+    let highestUndone = 1;
+    for (const [k, u] of Object.entries(kindUndone) as [TaskKind, number][]) {
+      if ((u ?? 0) > highestUndone) { highestUndone = u ?? 0; mostSkippedKind = k; }
+    }
+
+    const totalDone = Object.values(kindDone).reduce((s, v) => s + (v ?? 0), 0);
+    const hasData = totalDone >= 3;
+
+    return { preferredWorkoutTime, mostSkippedKind, hasData };
+  }, [behaviorPatterns]);
+
+  // ─── UserMemory — long-term intelligence derived from persisted inputs ────────
+  //
+  // All three inputs (history, taskFeedback, patternInsights) are already persisted,
+  // so this computed value survives app restarts without its own storage entry.
+  const userMemory = useMemo((): UserMemory => {
+    // Consistency score: rolling 7-day average task completion rate
+    const recentDays = history.slice(-7);
+    const consistencyScore = recentDays.length > 0
+      ? Math.round(
+          recentDays.reduce((sum, d) =>
+            sum + (d.tasksTotal > 0 ? d.tasksDone / d.tasksTotal : 0), 0
+          ) / recentDays.length * 100
+        )
+      : 0;
+
+    // Today's missed workout timeMin (used for "last missed" context)
+    const missedFeedback = Object.values(taskFeedback).find(
+      (e) => e.kind === "Workout" && !e.completed
+    );
+    const missedTask = missedFeedback
+      ? tasks.find((t) => t.id === missedFeedback.taskId)
+      : null;
+
+    return {
+      preferredWorkoutTime:  patternInsights.preferredWorkoutTime,
+      mostSkippedCategory:   patternInsights.mostSkippedKind,
+      consistencyScore,
+      lastMissedWorkoutTime: missedTask?.timeMin ?? null,
+    };
+  }, [history, taskFeedback, tasks, patternInsights]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Human-readable coaching line for Today screen (null = no pattern detected yet)
+  const patternCoachingLine: string | null = (() => {
+    if (!patternInsights.hasData && userMemory.consistencyScore === 0) return null;
+    if (patternInsights.preferredWorkoutTime)
+      return `You complete workouts most consistently in the ${patternInsights.preferredWorkoutTime} — front-load today's training.`;
+    if (patternInsights.mostSkippedKind === "Workout")
+      return "Workouts are your most-missed task — keep the workout short and do it first.";
+    if (patternInsights.mostSkippedKind === "Nutrition")
+      return "Nutrition tasks often slip — simplify: prep one clean meal and build from there.";
+    if (patternInsights.mostSkippedKind)
+      return `${patternInsights.mostSkippedKind} tasks tend to get skipped — make today's one non-negotiable.`;
+    if (userMemory.consistencyScore >= 80)
+      return `You've completed ${userMemory.consistencyScore}% of tasks over the last 7 days — keep the momentum going.`;
+    if (userMemory.consistencyScore > 0)
+      return `Your 7-day completion rate is ${userMemory.consistencyScore}% — focus on finishing what you start today.`;
+    return null;
+  })();
+
+  // Current coaching mode — single source of truth for tone across chat, UI, and banners
+  const coachMode = useMemo((): CoachMode => getCoachMode({
+    todayDoneCount,
+    rebalancedTaskCount: rebalancedTasks.length,
+    liveStreak,
+    gamePlan,
+    energyLevel:         recovery.energyLevel,
+    adaptTrigger:        adaptBanner?.trigger ?? null,
+    hasWorkoutRecovered,
+    hasMiddayAdjusted,
+    hasDayRecovered,
+  }), [todayDoneCount, rebalancedTasks.length, liveStreak, gamePlan, recovery.energyLevel, adaptBanner, hasWorkoutRecovered, hasMiddayAdjusted, hasDayRecovered]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Structured hint for the planner AI (injected into the API request)
+  const patternHintsForAI: string | null = (() => {
+    const hints: string[] = [];
+    if (patternInsights.preferredWorkoutTime === "morning")
+      hints.push("User consistently completes workouts in the morning — schedule Workout tasks before noon.");
+    else if (patternInsights.preferredWorkoutTime === "afternoon")
+      hints.push("User tends to complete workouts in the afternoon — schedule Workout tasks between noon and 5 PM.");
+    else if (patternInsights.preferredWorkoutTime === "evening")
+      hints.push("User tends to complete workouts in the evening — schedule Workout tasks after 5 PM.");
+
+    if (patternInsights.mostSkippedKind === "Workout")
+      hints.push("User frequently skips Workout tasks — reduce intensity, keep the workout under 30 min, schedule it early.");
+    else if (patternInsights.mostSkippedKind === "Nutrition")
+      hints.push("User frequently skips Nutrition tasks — reduce to 1–2 meal tasks and keep them simple.");
+    else if (patternInsights.mostSkippedKind)
+      hints.push(`User frequently skips ${patternInsights.mostSkippedKind} tasks — deprioritize or simplify them.`);
+
+    if (userMemory.consistencyScore >= 80)
+      hints.push(`User has a high 7-day consistency score (${userMemory.consistencyScore}%) — full plan is appropriate.`);
+    else if (userMemory.consistencyScore > 0 && userMemory.consistencyScore < 60)
+      hints.push(`User has a low 7-day consistency score (${userMemory.consistencyScore}%) — keep the plan short and achievable.`);
+
+    return hints.length > 0 ? hints.join(" ") : null;
+  })();
+
+  // Predictive insights — proactive coaching before failure happens (max 2, ordered by urgency)
+  const predictiveInsights = useMemo((): PredictiveInsight[] => {
+    const insights: PredictiveInsight[] = [];
+    const nowHour = new Date().getHours();
+
+    // 1. Streak protection — most urgent, time-sensitive
+    if (liveStreak > 0 && todayDoneCount === 0 && nowHour >= 12 && nowHour < 21) {
+      insights.push({
+        key:     "streak_risk",
+        label:   "STREAK PROTECTION",
+        message: `Don't break your ${liveStreak}-day streak — one small win keeps it alive.`,
+        action:  { label: "Get a reset nudge", trigger: "low_completion" },
+      });
+    }
+
+    // 2. Skip risk — if the user's most-skipped kind has an undone task today
+    if (patternInsights.hasData && patternInsights.mostSkippedKind && insights.length < 2) {
+      const atRisk = rebalancedTasks.find(
+        (t) => t.kind === patternInsights.mostSkippedKind && !t.done
+      );
+      if (atRisk) {
+        const kind = patternInsights.mostSkippedKind;
+        const msg  = kind === "Nutrition"
+          ? "You tend to skip Nutrition tasks — let's simplify today. One clean meal counts."
+          : kind === "Workout"
+          ? "You tend to skip Workout tasks — address it early before the window closes."
+          : `You tend to skip ${kind} tasks — tackle it first before it slips.`;
+        insights.push({
+          key:    "skip_risk",
+          label:  "SKIP RISK",
+          message: msg,
+          action: kind === "Workout"
+            ? { label: "Adjust workout", trigger: "missed_workout" }
+            : undefined,
+        });
+      }
+    }
+
+    // 3. Timing optimization — workout scheduled at non-preferred time
+    if (patternInsights.hasData && patternInsights.preferredWorkoutTime && insights.length < 2) {
+      const workout = rebalancedTasks.find((t) => t.kind === "Workout" && !t.done);
+      if (workout) {
+        const scheduledSlot = workout.timeMin < 720 ? "morning"
+          : workout.timeMin < 1020 ? "afternoon"
+          : "evening";
+        if (scheduledSlot !== patternInsights.preferredWorkoutTime) {
+          insights.push({
+            key:    "timing",
+            label:  "TIMING",
+            message: `You're more consistent with workouts in the ${patternInsights.preferredWorkoutTime} — consider moving this earlier.`,
+          });
+        }
+      }
+    }
+
+    return insights;
+  }, [patternInsights, liveStreak, todayDoneCount, rebalancedTasks]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Real-time next best action — recomputed on task change, time change, plan adaptation, or mode change
+  const nextBestAction = useMemo((): NextAction | null => {
+    const now = new Date();
+    return getNextBestAction({
+      tasks:     rebalancedTasks,
+      coachMode,
+      nowMin:    now.getHours() * 60 + now.getMinutes(),
+    });
+  }, [rebalancedTasks, coachMode]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Daily win condition — what must happen for today to count as a success
+  const winCondition = useMemo((): WinCondition | null => getWinCondition({
+    tasks:        rebalancedTasks,
+    coachMode,
+    gamePlan,
+    adaptTrigger: adaptBanner?.trigger ?? null,
+  }), [rebalancedTasks, coachMode, gamePlan, adaptBanner]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // End-of-day evaluation — computed live; shown after 8 PM or when all tasks are done
+  const dayEvaluation = useMemo((): DayEvaluation | null => {
+    const nowHour = new Date().getHours();
+    const tasksDone = rebalancedTasks.filter((t) => t.done).length;
+    // Only evaluate if it's evening OR the user has completed everything
+    if (nowHour < 20 && tasksDone < rebalancedTasks.length) return null;
+    if (!rebalancedTasks.length) return null;
+    return evaluateDay({
+      tasks:            rebalancedTasks,
+      winCondition,
+      consistencyScore: userMemory.consistencyScore,
+      coachMode,
+    });
+  }, [rebalancedTasks, winCondition, userMemory.consistencyScore, coachMode]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Tomorrow prep — only surfaces alongside the day evaluation
+  const tomorrowPrep = useMemo((): TomorrowPrep | null => getTomorrowPrep({
+    dayEvaluation,
+    tasks:            rebalancedTasks,
+    coachMode,
+    consistencyScore: userMemory.consistencyScore,
+  }), [dayEvaluation, rebalancedTasks, coachMode, userMemory.consistencyScore]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Weekly momentum — multi-day signal from stored history + consistency score
+  const weeklyMomentum = useMemo((): WeeklyMomentum | null => getWeeklyMomentum({
+    history,
+    consistencyScore: userMemory.consistencyScore,
+    currentStreak:    liveStreak,
+  }), [history, userMemory.consistencyScore, liveStreak]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Save The Day — real-time streak protection signal
+  const saveTheDay = useMemo((): SaveTheDay => {
+    const now = new Date();
+    return getSaveTheDayAction({
+      tasks:          rebalancedTasks,
+      nowMin:         now.getHours() * 60 + now.getMinutes(),
+      liveStreak,
+      todayDoneCount,
+      planLocked,
+      dismissed:      saveTheDayDismissed,
+    });
+  }, [rebalancedTasks, liveStreak, todayDoneCount, planLocked, saveTheDayDismissed]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Auto-dismiss Save The Day when the user completes a task
+  React.useEffect(() => {
+    if (saveTheDayDismissed && todayDoneCount > 0) {
+      setSaveTheDayDismissed(false); // reset so it can fire again if needed
+    }
+  }, [todayDoneCount, saveTheDayDismissed]);
+
+  // Energy state — derived from check-in + recent miss trend
+  const energyState = useMemo((): EnergyState => {
+    const recentMissCount = history.slice(-3).filter(
+      (d) => d.evalStatus === "MISS" || (!d.evalStatus && d.score > 0 && d.score < 40)
+    ).length;
+    return deriveEnergyState({
+      energyLevel:     recovery.energyLevel,
+      soreness:        recovery.soreness     ?? null,
+      motivationLevel: recovery.motivationLevel ?? null,
+      recentMissCount,
+      adaptTrigger:    adaptBanner?.trigger ?? null,
+    });
+  }, [recovery, history, adaptBanner]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Energy adaptation — modifies task order/content based on energy state
+  // Only applies when no manual adaptation is already active (respect user overrides)
+  const energyAdaptation = useMemo((): EnergyAdaptation => {
+    // Don't layer on top of an existing manual/auto-pilot adaptation
+    if (adaptedTasks !== null) return { modifiedTasks: rebalancedTasks };
+    if (energyState === "MEDIUM")  return { modifiedTasks: rebalancedTasks };
+    return adaptPlanToEnergy(rebalancedTasks, energyState);
+  }, [rebalancedTasks, energyState, adaptedTasks]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Readiness state — start-of-day interpretation of check-in + energy signals
+  const readinessState = useMemo((): ReadinessState | null => getReadinessState({
+    gamePlan,
+    energyState,
+    energyLevel: recovery.energyLevel,
+    soreness:    recovery.soreness ?? null,
+  }), [gamePlan, energyState, recovery.energyLevel, recovery.soreness]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Program Brain — forward adjustment: apply today's outcomes to upcoming program days.
+  // Fires once when dayEvaluation first appears (evening or all tasks done).
+  // Uses a ref to prevent re-firing in the same session after the update is applied.
+  const programAdjustFiredRef = React.useRef<string>("");
+  React.useEffect(() => {
+    if (!dayEvaluation) return; // evaluation not ready yet
+    const todayStr = new Date().toISOString().slice(0, 10);
+    if (programAdjustFiredRef.current === todayStr) return; // already adjusted today in this session
+    programAdjustFiredRef.current = todayStr;
+
+    const missedWorkoutTask       = rebalancedTasks.find((t) => t.kind === "Workout" && !t.done);
+    const missedHighPriorityTasks = rebalancedTasks.filter(
+      (t) => !t.done && (t.priority ?? "medium") === "high"
+    );
+    const signals: ProgramSignals = {
+      missedWorkout:           !!missedWorkoutTask,
+      missedWorkoutTask,
+      missedHighPriorityTasks,
+      lowEnergy:               energyState === "LOW",
+      highCompletion:          dayEvaluation.status === "WIN",
+      recoveryModeTriggered:   gamePlan?.readiness === "Recover" || adaptBanner?.trigger === "low_energy",
+      dayMissed:               dayEvaluation.status === "MISS",
+    };
+
+    const hasAnySignal =
+      signals.missedHighPriorityTasks.length > 0 ||
+      signals.lowEnergy ||
+      signals.dayMissed ||
+      signals.recoveryModeTriggered;
+
+    setProgramPlan((prev) => prev ? updateFutureProgramDays(prev, currentDayIndex, signals) : prev);
+
+    // Surface a brief nudge so the user understands why tomorrow changed
+    if (hasAnySignal) {
+      if (signals.missedHighPriorityTasks.length > 0) {
+        showSystemNudge("Carried unfinished priorities to tomorrow.");
+      } else if (signals.dayMissed) {
+        showSystemNudge("Simplified tomorrow to help you reset.");
+      } else if (signals.lowEnergy) {
+        showSystemNudge("Lightened tomorrow based on today's energy.");
+      } else if (signals.recoveryModeTriggered) {
+        showSystemNudge("Adjusted tomorrow for recovery.");
+      }
+    }
+  }, [dayEvaluation]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Shared context object — single source of truth passed into ChatScreen
+  const userContext = useMemo(() => {
+    const doneCount  = rebalancedTasks.filter((t) => t.done).length;
+    const totalCount = rebalancedTasks.length;
+    const highLeft   = rebalancedTasks.filter((t) => !t.done && (t.priority ?? "medium") === "high");
+    const parts: string[] = [
+      `Goal: ${profile?.goals?.goalLabel ?? "not set"}`,
+      `Streak: ${liveStreak} day${liveStreak !== 1 ? "s" : ""}`,
+      `Score: ${score}/100`,
+      `Tasks: ${doneCount}/${totalCount} done`,
+      ...(highLeft.length ? [`High-priority remaining: ${highLeft.map((t) => t.title).join(", ")}`] : []),
+      ...(recovery.energyLevel ? [`Energy: ${recovery.energyLevel}`] : []),
+      ...(gamePlan ? [`Readiness: ${gamePlan.readiness}, mode: ${gamePlan.timeMode}`] : []),
+      ...(aiPlan?.summary ? [`Plan: ${aiPlan.summary}`] : []),
+      ...(patternInsights.preferredWorkoutTime
+        ? [`Preferred workout time: ${patternInsights.preferredWorkoutTime}`] : []),
+      ...(patternInsights.mostSkippedKind
+        ? [`Often skips: ${patternInsights.mostSkippedKind}`] : []),
+      ...(userMemory.consistencyScore > 0
+        ? [`Consistency: ${userMemory.consistencyScore}%`] : []),
+    ];
+    return parts.join(" | ");
+  }, [rebalancedTasks, score, liveStreak, profile, recovery, gamePlan, aiPlan, patternInsights, userMemory]);
+
+  // Serialised memory string passed to the chat API (and to ChatScreen as a prop)
+  const memoryContext = useMemo((): string => {
+    const parts: string[] = [];
+    if (userMemory.preferredWorkoutTime)
+      parts.push(`User is most consistent with workouts in the ${userMemory.preferredWorkoutTime}.`);
+    if (userMemory.mostSkippedCategory)
+      parts.push(`User often skips ${userMemory.mostSkippedCategory} tasks.`);
+    if (userMemory.consistencyScore > 0)
+      parts.push(`Consistency score: ${userMemory.consistencyScore}% (7-day rolling average).`);
+    return parts.join(" ");
+  }, [userMemory]);
+
+  // Adaptive Day Engine — apply a rule-based adaptation to the current task list
+  const triggerAdaptation = React.useCallback((trigger: AdaptTrigger) => {
+    const source = adaptedTasks ?? rebalancedTasks; // layer on top of any existing adaptation
+    const result = adaptTodayPlan(source, trigger);
+    if (trigger !== "low_completion") setAdaptedTasks(result.tasks);
+    if (adaptBannerTimerRef.current) clearTimeout(adaptBannerTimerRef.current);
+    setAdaptBanner(result);
+    // Low-completion message auto-clears; others persist until dismissed or plan reloads
+    if (trigger === "low_completion") {
+      adaptBannerTimerRef.current = setTimeout(() => setAdaptBanner(null), 6000);
+    }
+  }, [adaptedTasks, rebalancedTasks]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Auto-dismiss banner — surfaces after any command triggers, clears after 3.5s
+  const showCommandBanner = React.useCallback((msg: string) => {
+    if (commandBannerTimerRef.current) clearTimeout(commandBannerTimerRef.current);
+    setCommandBanner(msg);
+    commandBannerTimerRef.current = setTimeout(() => setCommandBanner(null), 3500);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const nudgeFadeAnim = React.useRef(new Animated.Value(0)).current;
+
+  // Fade nudge in when it appears, let state removal handle hiding
+  useEffect(() => {
+    if (systemNudge !== null) {
+      nudgeFadeAnim.setValue(0);
+      Animated.timing(nudgeFadeAnim, { toValue: 1, duration: 280, useNativeDriver: true }).start();
+    }
+  }, [systemNudge]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // System nudge — shown when the system silently adjusts the plan, auto-dismisses after 5s
+  const showSystemNudge = React.useCallback((msg: string) => {
+    if (systemNudgeTimerRef.current) clearTimeout(systemNudgeTimerRef.current);
+    setSystemNudge(msg);
+    systemNudgeTimerRef.current = setTimeout(() => setSystemNudge(null), 5000);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Chat → plan action bridge — handles both legacy strings and CommandType values
+  const handlePlanAction = (action: string) => {
+    // When plan is locked, only LOCK_PLAN itself can unlock
+    if (planLocked && action !== "LOCK_PLAN") {
+      showCommandBanner("Plan is locked — unlock it first.");
+      setTab("Home");
+      return;
+    }
+
+    switch (action) {
+      case "LESS_TIME":
+      case "less_time": {
+        triggerAdaptation("less_time");
+        showCommandBanner("Plan adjusted for limited time.");
+        const override: RecoveryData = { ...recovery, timeAvailable: "minimal" };
+        const newGp = generateGamePlan(override);
+        setRecovery(override);
+        setGamePlan(newGp);
+        generateAIPlan(override, newGp); // deeper AI adaptation in background
+        break;
+      }
+      case "MISSED_WORKOUT":
+      case "missed_workout": {
+        triggerAdaptation("missed_workout");
+        showCommandBanner("Workout re-prioritized.");
+        break;
+      }
+      case "LOW_ENERGY": {
+        triggerAdaptation("low_energy");
+        showCommandBanner("Low energy mode activated.");
+        break;
+      }
+      case "SHIFT_LATER": {
+        triggerAdaptation("shift_later");
+        showCommandBanner("Plan shifted later.");
+        break;
+      }
+      case "LOCK_PLAN": {
+        setPlanLocked((prev) => {
+          const next = !prev;
+          showCommandBanner(next ? "Plan locked in — no adjustments." : "Plan unlocked.");
+          return next;
+        });
+        setTab("Home");
+        return; // early return — setTab already called
+      }
+      case "adjust":
+      default: {
+        generateAIPlan();
+        showCommandBanner("Rebuilding your plan…");
+        break;
+      }
+    }
+
+    setTab("Home");
+  };
+
   /**
-   * Sync a task's done state to the backend and reconcile local state from
-   * the server's response. Local state is updated optimistically before this
-   * runs — this ensures the persisted state stays in sync.
+   * Legacy server task sync — kept for backward compatibility only.
+   *
+   * Since Phase 7, tasks are generated locally by the Aira bridge. Task IDs follow
+   * the deterministic format `{engine}-{kind}-{index}` (e.g. "planner-workout-0").
+   * The server has no record of these IDs, so the PATCH will fail with 404 or 500
+   * and is caught silently. The local optimistic update (done in toggleTaskById
+   * before this runs) is the real source of truth — dc:tasks auto-saves the result.
+   *
+   * Do not remove until the server planner route is formally deprecated.
    */
   const syncAIPlanTask = async (taskId: string, done: boolean) => {
     if (!authUser) return;
@@ -3683,10 +6792,18 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
     }
   };
 
-  // Once both auth and local storage are ready:
-  //   1. Pull profile/blocks/streak/tasks from Supabase (source of truth for user data)
-  //   2. Then fetch today's AI plan — runs AFTER Supabase so its task list wins
-  // The AI plan fetch shows a loading state so users never see an empty-state flash.
+  // Startup sequence — runs once when auth is ready and local AsyncStorage has loaded.
+  //
+  // Order of operations (all three steps complete before the spinner clears):
+  //   1. Local AsyncStorage restore (mount useEffect) — dc:ai_plan, dc:tasks, dc:profile,
+  //      etc. are read and set into state before this effect ever fires.
+  //   2. Supabase user data (Step 1 below) — profile, blocks, streak, manual tasks
+  //      fetched from the server and merged into state.
+  //   3. fetchTodayAIPlan (Step 2 below) — legacy server fetch. Returns 404 for all
+  //      Aira-generated plans and acts as a no-op. Does NOT override the Aira plan
+  //      restored in step 1 in practice. See fetchTodayAIPlan comment for details.
+  //
+  // The loading spinner covers steps 2 + 3 so users never see an empty-state flash.
   useEffect(() => {
     if (!authUser || !loaded) return;
 
@@ -3711,7 +6828,7 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
         // Non-fatal — local storage already populated state
       }
 
-      // Step 2 — AI plan (overwrites tasks above if a plan exists for today)
+      // Step 2 — Legacy server plan fetch. 404 no-op for all Aira-generated plans.
       try {
         await fetchTodayAIPlan(authUser.id);
       } finally {
@@ -3726,21 +6843,21 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
   useEffect(() => {
     if (!loaded || !profile) return;
     AsyncStorage.setItem(STORE.profile, JSON.stringify(profile)).catch(console.warn);
-    if (authUser) getAccessToken().then((t) => t && saveUserData(authUser.id, t, { profile })).catch(console.warn);
+    if (authUser) getAccessToken().then((t) => { if (t) saveUserData(authUser.id, t, { profile }); }).catch(console.warn);
   }, [profile, loaded]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Save blocks whenever they change (after initial load)
   useEffect(() => {
     if (!loaded) return;
     AsyncStorage.setItem(STORE.blocks, JSON.stringify(blocks)).catch(console.warn);
-    if (authUser) getAccessToken().then((t) => t && saveUserData(authUser.id, t, { blocks })).catch(console.warn);
+    if (authUser) getAccessToken().then((t) => { if (t) saveUserData(authUser.id, t, { blocks }); }).catch(console.warn);
   }, [blocks, loaded]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Save tasks whenever they change (after initial load)
   useEffect(() => {
     if (!loaded) return;
     AsyncStorage.setItem(STORE.tasks, JSON.stringify(tasks)).catch(console.warn);
-    if (authUser) getAccessToken().then((t) => t && saveUserData(authUser.id, t, { tasks })).catch(console.warn);
+    if (authUser) getAccessToken().then((t) => { if (t) saveUserData(authUser.id, t, { tasks }); }).catch(console.warn);
   }, [tasks, loaded]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Save chat messages and sessionId whenever either changes (after initial load)
@@ -3753,7 +6870,7 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
   useEffect(() => {
     if (!loaded) return;
     AsyncStorage.setItem(STORE.streak, JSON.stringify(streak)).catch(console.warn);
-    if (authUser) getAccessToken().then((t) => t && saveUserData(authUser.id, t, { streak })).catch(console.warn);
+    if (authUser) getAccessToken().then((t) => { if (t) saveUserData(authUser.id, t, { streak }); }).catch(console.warn);
   }, [streak, loaded]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Save recovery whenever it changes (after initial load)
@@ -3768,7 +6885,19 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
     AsyncStorage.setItem(STORE.feedback, JSON.stringify(taskFeedback)).catch(console.warn);
   }, [taskFeedback, loaded]);
 
-  // Upsert today's score into history whenever score changes (after initial load)
+  // Save behavior patterns whenever they change (after initial load)
+  useEffect(() => {
+    if (!loaded) return;
+    AsyncStorage.setItem(STORE.patterns, JSON.stringify(behaviorPatterns)).catch(console.warn);
+  }, [behaviorPatterns, loaded]);
+
+  // Save programPlan whenever it changes (after initial load)
+  useEffect(() => {
+    if (!loaded || !programPlan) return;
+    AsyncStorage.setItem(STORE.programPlan, JSON.stringify(programPlan)).catch(console.warn);
+  }, [programPlan, loaded]);
+
+  // Upsert today's score + evaluation status into history whenever score or evaluation changes
   useEffect(() => {
     if (!loaded) return;
     const todayStr = new Date().toISOString().slice(0, 10);
@@ -3777,17 +6906,139 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
     historyLastDateRef.current  = todayStr;
     setHistory((prev) => {
       const without = prev.filter((d) => d.date !== todayStr);
-      return [...without, { date: todayStr, score, tasksTotal: tasks.length, tasksDone: tasks.filter((t) => t.done).length }]
+      const entry: DayLog = {
+        date: todayStr,
+        score,
+        tasksTotal: tasks.length,
+        tasksDone:  tasks.filter((t) => t.done).length,
+        ...(dayEvaluation ? { evalStatus: dayEvaluation.status } : {}),
+      };
+      return [...without, entry]
         .sort((a, b) => a.date.localeCompare(b.date))
         .slice(-30);
     });
-  }, [score, loaded]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [score, dayEvaluation, loaded]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Save history whenever it changes (after initial load)
   useEffect(() => {
     if (!loaded) return;
     AsyncStorage.setItem(STORE.history, JSON.stringify(history)).catch(console.warn);
   }, [history, loaded]);
+
+  // Inactivity nudge — show "Start here" after 12s of no completions on Today tab
+  useEffect(() => {
+    if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
+    if (tab === "Home" && overlay === null && todayDoneCount === 0 && rebalancedTasks.length > 0) {
+      inactivityTimerRef.current = setTimeout(() => setShowStartNudge(true), 12000);
+    } else {
+      setShowStartNudge(false);
+    }
+    return () => {
+      if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
+    };
+  }, [tab, todayDoneCount, rebalancedTasks.length]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ─── Auto-Pilot: proactive adaptation ────────────────────────────────────────
+  //
+  // Evaluates three trigger conditions whenever the Today tab is active.
+  // At most one trigger fires per evaluation; each flag ensures it fires once per session.
+  // The interval re-checks every 2 min so conditions are caught even without user interaction.
+  //
+  // Fires at most once per flag, in priority order: MIDDAY → WORKOUT → DAY_RECOVERY.
+  useEffect(() => {
+    if (tab !== "Home" || planLocked || !loaded) return;
+
+    const evaluate = () => {
+      // Latest snapshot — read inside evaluate() to avoid stale closure issues
+      // (the effect re-runs when any dep changes, so deps are fresh on each run)
+      const source    = adaptedTasks ?? rebalancedTasks;
+      const doneCount = source.filter((t) => t.done).length;
+      if (!source.length) return;
+
+      const nowHour = new Date().getHours();
+      const nowMin  = nowHour * 60 + new Date().getMinutes();
+
+      // IN-DAY REBALANCE — silent background compression; runs on every evaluate() tick.
+      // Operates on base rebalancedTasks (not adaptedTasks) so it doesn't layer on top
+      // of an explicit big-adaptation. adaptedTasks takes priority in effectiveTasks.
+      if (!adaptedTasks) {
+        const inDay = rebalanceCurrentDay(rebalancedTasks, doneCount, nowMin);
+        setInDayRebalancedTasks(inDay); // null clears a previous compression
+      }
+
+      // 1. MIDDAY_ADJUST — no completions after noon
+      if (!hasMiddayAdjusted && doneCount === 0 && nowHour >= 12) {
+        setHasMiddayAdjusted(true);
+        const result = adaptTodayPlan(source, "less_time");
+        setAdaptedTasks(result.tasks);
+        setAdaptBanner(result);
+        showCommandBanner(AUTO_PILOT_BANNERS.MIDDAY_ADJUST[coachMode]);
+        setMessages((prev) =>
+          prev.length === 0 ? prev : [...prev, {
+            role: "assistant" as const,
+            content: coachMode === "PUSH"
+              ? "You haven't started. I've cut the plan to essentials — pick one and go now."
+              : "Let's refocus — I've adjusted your plan so you can still win today. What's the one thing you can execute right now?",
+          }]
+        );
+        return;
+      }
+
+      // 2. MISSED_WORKOUT_AUTO — workout is 90+ min past its scheduled slot
+      if (!hasWorkoutRecovered) {
+        const workout = source.find((t) => t.kind === "Workout" && !t.done);
+        if (workout && nowMin > workout.timeMin + 90) {
+          setHasWorkoutRecovered(true);
+          const result = adaptTodayPlan(source, "missed_workout");
+          setAdaptedTasks(result.tasks);
+          setAdaptBanner(result);
+          showCommandBanner(AUTO_PILOT_BANNERS.MISSED_WORKOUT_AUTO[coachMode]);
+          setMessages((prev) =>
+            prev.length === 0 ? prev : [...prev, {
+              role: "assistant" as const,
+              content: coachMode === "PUSH"
+                ? "Workout window is gone. I've re-prioritized it — 20 minutes, right now. No more waiting."
+                : "Your workout window passed — I've moved it up. A 20-minute session still counts. Go when you're ready.",
+            }]
+          );
+          return;
+        }
+      }
+
+      // 3. DAY_RECOVERY — 3+ tasks undone after 6 PM
+      if (!hasDayRecovered && nowHour >= 18) {
+        const undone = source.filter((t) => !t.done);
+        if (undone.length >= 3) {
+          setHasDayRecovered(true);
+          const result = adaptTodayPlan(source, "less_time");
+          setAdaptedTasks(result.tasks);
+          setAdaptBanner(result);
+          showCommandBanner(AUTO_PILOT_BANNERS.DAY_RECOVERY[coachMode]);
+          setMessages((prev) =>
+            prev.length === 0 ? prev : [...prev, {
+              role: "assistant" as const,
+              content: coachMode === "PUSH"
+                ? "Evening. Three tasks still open. I've stripped the plan — hit the essentials and close the day."
+                : "Evening check-in — I've simplified the plan. Hit the essentials and close the day strong.",
+            }]
+          );
+        }
+      }
+    };
+
+    evaluate(); // immediate check when deps change
+    const id = setInterval(evaluate, 2 * 60_000); // re-check every 2 min
+    return () => clearInterval(id);
+  }, [tab, todayDoneCount, rebalancedTasks, adaptedTasks, planLocked, loaded, coachMode, hasMiddayAdjusted, hasWorkoutRecovered, hasDayRecovered]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // System nudge — fire once when in-day rebalance activates (null → non-null transition)
+  const prevInDayRebalancedRef = React.useRef<TimedTask[] | null>(null);
+  useEffect(() => {
+    if (inDayRebalancedTasks !== null && prevInDayRebalancedRef.current === null) {
+      showSystemNudge("Refocused your day on what matters most.");
+    }
+    prevInDayRebalancedRef.current = inDayRebalancedTasks;
+  }, [inDayRebalancedTasks]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     (async () => {
@@ -3850,19 +7101,23 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
   }
 
   function generatePlanFromProfileAndSchedule(p: Profile, schedule: ScheduleBlock[]) {
-    const wakeMin = parseTimeToMinutes(p.wake);
-    const sleepMin = parseTimeToMinutes(p.sleep);
+    const wakeMin  = parseTimeToMinutes(p.sleep.wakeTime);
+    const sleepMin = parseTimeToMinutes(p.sleep.sleepTime);
 
     if (wakeMin == null || sleepMin == null) {
       Alert.alert("Time format issue", "Enter wake/sleep like '7:00 AM' or '23:00'.");
       return;
     }
-    if (sleepMin <= wakeMin + 60) {
-      Alert.alert("Sleep time issue", "Sleep must be at least 1 hour after wake.");
+
+    const duration = sleepDurationMins(p.sleep.sleepTime, p.sleep.wakeTime);
+    if (duration == null || duration < 60) {
+      Alert.alert("Sleep time issue", "Sleep window must be at least 1 hour.");
       return;
     }
 
-    const plan = buildTodaysPlan({ wakeMin, sleepMin, blocks: schedule, profile: p });
+    // Pass overnight-adjusted sleepMin so buildTodaysPlan gets a positive dayLen
+    const adjustedSleepMin = sleepMin <= wakeMin ? sleepMin + 1440 : sleepMin;
+    const plan = buildTodaysPlan({ wakeMin, sleepMin: adjustedSleepMin, blocks: schedule, profile: p });
     setTasks(plan);
     scheduleFromTasks(plan);
   }
@@ -3883,343 +7138,53 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
   }
 
   // ---------- Auth gate ----------
-  // Show splash while Supabase checks stored session or AsyncStorage is loading.
-  if (!authChecked || !loaded) return <Splash />;
+  // Keep Splash mounted until its own fade-out completes — no hard cut.
+  // `ready` signals the Splash to start its exit animation; `onFinish` unmounts it.
+  if (!splashDone) {
+    return (
+      <Splash
+        ready={authChecked && loaded && minTimePassed}
+        onFinish={() => setSplashDone(true)}
+      />
+    );
+  }
 
   // No session → show sign in / sign up.
   if (!authUser) return <AuthScreen onSuccess={setAuthUser} />;
 
   // ---------- Onboarding ----------
   if (!authed) {
-    // ── Shared option-card renderer ──────────────────────────────────────
-    const OptionCard = ({
-      value,
-      label,
-      desc,
-      selected,
-      onSelect,
-    }: {
-      value: string;
-      label: string;
-      desc: string;
-      selected: boolean;
-      onSelect: () => void;
-    }) => (
-      <Pressable
-        onPress={onSelect}
-        style={{
-          backgroundColor: selected ? "#12122a" : "#0a0a0a",
-          borderWidth: 1,
-          borderColor: selected ? ACCENT : "#2d2b5a",
-          borderRadius: 14,
-          padding: 16,
-          marginBottom: 10,
-        }}
-      >
-        <Text style={{ color: "#fff", fontWeight: "800", fontSize: 14 }}>
-          {label}
-        </Text>
-        <Text style={{ color: "#777", fontSize: 12, marginTop: 4 }}>
-          {desc}
-        </Text>
-      </Pressable>
-    );
-
-    // ── Step 1 — Basic info ───────────────────────────────────────────────
-    if (onboardingStep === 1) {
-      const canAdvance = name.trim().length >= 2;
-      return (
-        <SafeAreaView style={styles.screen}>
-          <StatusBar barStyle="light-content" />
-          <Text style={styles.h1}>Aira</Text>
-          <Text style={styles.sub}>Routine → Consistency → Physique.</Text>
-
-          <Card>
-            <Text style={styles.label}>Name</Text>
-            <TextInput
-              value={name}
-              onChangeText={setName}
-              placeholder="e.g., Nate"
-              placeholderTextColor="#777"
-              style={styles.input}
-            />
-
-            <View style={{ height: 12 }} />
-
-            <Text style={styles.label}>Goal</Text>
-            <TextInput value={goal} onChangeText={setGoal} style={styles.input} />
-
-            <View style={{ height: 12 }} />
-
-            <Text style={styles.label}>Wake time</Text>
-            <TextInput value={wake} onChangeText={setWake} style={styles.input} />
-
-            <View style={{ height: 12 }} />
-
-            <Text style={styles.label}>Sleep time</Text>
-            <TextInput value={sleep} onChangeText={setSleep} style={styles.input} />
-          </Card>
-
-          <View style={{ flexDirection: "row" }}>
-            <PrimaryButton
-              title="Next  →"
-              disabled={!canAdvance}
-              onPress={() => setOnboardingStep(2)}
-            />
-          </View>
-
-          <Text style={styles.miniNote}>
-            After setup you’ll be asked for notification permission. Approve it to activate reminders.
-          </Text>
-        </SafeAreaView>
-      );
-    }
-
-    // ── Step 2 — Starting point ───────────────────────────────────────────
-    const startingOptions = [
-      { value: "soft",         label: "Soft / Skinny Fat",   desc: "Visible softness, low definition, little training base" },
-      { value: "average",      label: "Average / Untrained", desc: "Normal composition, no consistent training history" },
-      { value: "somewhat_lean",label: "Somewhat Lean",       desc: "Moderate body fat, some muscle, inconsistent training" },
-      { value: "athletic",     label: "Athletic / Lean",     desc: "Low body fat, solid muscle base, active lifestyle" },
-    ];
-
-    if (onboardingStep === 2) {
-      return (
-        <SafeAreaView style={styles.screen}>
-          <StatusBar barStyle="light-content" />
-          <Text style={styles.h1}>Starting point</Text>
-          <Text style={styles.sub}>Where are you right now?</Text>
-
-          <View style={{ flex: 1 }}>
-            {startingOptions.map((o) => (
-              <OptionCard
-                key={o.value}
-                value={o.value}
-                label={o.label}
-                desc={o.desc}
-                selected={startingPoint === o.value}
-                onSelect={() => setStartingPoint(o.value)}
-              />
-            ))}
-          </View>
-
-          <View style={{ flexDirection: "row" }}>
-            <PrimaryButton
-              title="Next  →"
-              disabled={startingPoint === ""}
-              onPress={() => setOnboardingStep(3)}
-            />
-          </View>
-
-          <Pressable onPress={() => setOnboardingStep(1)} style={{ alignItems: "center", paddingVertical: 10 }}>
-            <Text style={styles.miniNote}>← Back</Text>
-          </Pressable>
-        </SafeAreaView>
-      );
-    }
-
-    // ── Step 3 — Target goal + body-fat direction ────────────────────────
-    const targetOptions = [
-      { value: "lean_defined",   label: "Lean & Defined",     desc: "Visible muscle definition, athletic physique" },
-      { value: "model_build",    label: "Model Build",         desc: "Very lean, V-taper, aesthetic proportions" },
-      { value: "athletic_strong",label: "Athletic & Strong",   desc: "Strength and performance, lean but powerful" },
-      { value: "shredded",       label: "Shredded",            desc: "Elite-level leanness, maximum definition" },
-    ];
-    const bodyFatOptions = [
-      { value: "lose_fat",    label: "Lose Fat",         desc: "Reduce body fat — stay in a caloric deficit" },
-      { value: "maintain",    label: "Maintain",          desc: "Hold current composition while building habits" },
-      { value: "build_lean",  label: "Build Lean Mass",   desc: "Gain muscle with minimal fat — slight surplus" },
-    ];
-
-    if (onboardingStep === 3) {
-      return (
-        <SafeAreaView style={styles.screen}>
-          <StatusBar barStyle="light-content" />
-          <ScrollView contentContainerStyle={{ padding: 20, paddingBottom: 40 }}>
-            <Text style={styles.h1}>Target</Text>
-            <Text style={styles.sub}>What are you building toward?</Text>
-            <View style={{ height: 12 }} />
-
-            {targetOptions.map((o) => (
-              <OptionCard
-                key={o.value}
-                value={o.value}
-                label={o.label}
-                desc={o.desc}
-                selected={targetGoal === o.value}
-                onSelect={() => setTargetGoal(o.value)}
-              />
-            ))}
-
-            <View style={{ height: 16 }} />
-            <Text style={styles.label}>Body composition direction</Text>
-            <View style={{ height: 8 }} />
-
-            {bodyFatOptions.map((o) => (
-              <OptionCard
-                key={o.value}
-                value={o.value}
-                label={o.label}
-                desc={o.desc}
-                selected={bodyFatDirection === o.value}
-                onSelect={() => setBodyFatDirection(o.value)}
-              />
-            ))}
-
-            <View style={{ height: 16 }} />
-            <PrimaryButton
-              title="Next  →"
-              disabled={targetGoal === "" || bodyFatDirection === ""}
-              onPress={() => setOnboardingStep(4)}
-            />
-            <Pressable onPress={() => setOnboardingStep(2)} style={{ alignItems: "center", paddingVertical: 10 }}>
-              <Text style={styles.miniNote}>← Back</Text>
-            </Pressable>
-          </ScrollView>
-        </SafeAreaView>
-      );
-    }
-
-    // ── Step 4 — Experience + equipment ──────────────────────────────────
-    const experienceOptions = [
-      { value: "beginner",     label: "Beginner",      desc: "New to structured training — under 1 year" },
-      { value: "intermediate", label: "Intermediate",  desc: "1–3 years of consistent training" },
-      { value: "advanced",     label: "Advanced",      desc: "3+ years, strong foundation and technique" },
-    ];
-    const equipmentOptions = [
-      { value: "none",     label: "No Equipment",       desc: "Bodyweight only — home or travel workouts" },
-      { value: "minimal",  label: "Minimal Equipment",  desc: "Dumbbells, bands, or a pull-up bar" },
-      { value: "full_gym", label: "Full Gym Access",    desc: "Barbells, machines, full weight room" },
-    ];
-
-    if (onboardingStep === 4) {
-      return (
-        <SafeAreaView style={styles.screen}>
-          <StatusBar barStyle="light-content" />
-          <ScrollView contentContainerStyle={{ padding: 20, paddingBottom: 40 }}>
-            <Text style={styles.h1}>Training setup</Text>
-            <Text style={styles.sub}>How you train shapes the plan.</Text>
-            <View style={{ height: 12 }} />
-
-            <Text style={styles.label}>Experience level</Text>
-            <View style={{ height: 8 }} />
-            {experienceOptions.map((o) => (
-              <OptionCard
-                key={o.value}
-                value={o.value}
-                label={o.label}
-                desc={o.desc}
-                selected={experienceLevel === o.value}
-                onSelect={() => setExperienceLevel(o.value)}
-              />
-            ))}
-
-            <View style={{ height: 16 }} />
-            <Text style={styles.label}>Available equipment</Text>
-            <View style={{ height: 8 }} />
-            {equipmentOptions.map((o) => (
-              <OptionCard
-                key={o.value}
-                value={o.value}
-                label={o.label}
-                desc={o.desc}
-                selected={equipment === o.value}
-                onSelect={() => setEquipment(o.value)}
-              />
-            ))}
-
-            <View style={{ height: 16 }} />
-            <PrimaryButton
-              title="Next  →"
-              disabled={experienceLevel === "" || equipment === ""}
-              onPress={() => setOnboardingStep(5)}
-            />
-            <Pressable onPress={() => setOnboardingStep(3)} style={{ alignItems: "center", paddingVertical: 10 }}>
-              <Text style={styles.miniNote}>← Back</Text>
-            </Pressable>
-          </ScrollView>
-        </SafeAreaView>
-      );
-    }
-
-    // ── Step 5 — Frequency + daily training time ──────────────────────────
-    const frequencyOptions = [
-      { value: "2x", label: "2× per week",  desc: "Minimal commitment — quality over quantity" },
-      { value: "3x", label: "3× per week",  desc: "Solid foundation — standard recommendation" },
-      { value: "4x", label: "4× per week",  desc: "Serious training — good recovery balance" },
-      { value: "5x", label: "5× per week",  desc: "High frequency — advanced athletes" },
-    ];
-    const durationOptions = [
-      { value: "20min", label: "20 minutes",  desc: "Short and focused — no time to waste" },
-      { value: "30min", label: "30 minutes",  desc: "Efficient — most popular training window" },
-      { value: "45min", label: "45 minutes",  desc: "Full session — warm-up through cooldown" },
-      { value: "60min", label: "60 minutes",  desc: "Complete session — strength + accessory work" },
-    ];
-
     return (
-      <SafeAreaView style={styles.screen}>
-        <StatusBar barStyle="light-content" />
-        <ScrollView contentContainerStyle={{ padding: 20, paddingBottom: 40 }}>
-          <Text style={styles.h1}>Schedule</Text>
-          <Text style={styles.sub}>How often and how long?</Text>
-          <View style={{ height: 12 }} />
-
-          <Text style={styles.label}>Workout frequency</Text>
-          <View style={{ height: 8 }} />
-          {frequencyOptions.map((o) => (
-            <OptionCard
-              key={o.value}
-              value={o.value}
-              label={o.label}
-              desc={o.desc}
-              selected={workoutFrequency === o.value}
-              onSelect={() => setWorkoutFrequency(o.value)}
-            />
-          ))}
-
-          <View style={{ height: 16 }} />
-          <Text style={styles.label}>Daily training time</Text>
-          <View style={{ height: 8 }} />
-          {durationOptions.map((o) => (
-            <OptionCard
-              key={o.value}
-              value={o.value}
-              label={o.label}
-              desc={o.desc}
-              selected={dailyTrainingTime === o.value}
-              onSelect={() => setDailyTrainingTime(o.value)}
-            />
-          ))}
-
-          <View style={{ height: 16 }} />
-          <PrimaryButton
-            title="Create my plan"
-            disabled={workoutFrequency === "" || dailyTrainingTime === ""}
-            onPress={() => {
-              const p: Profile = {
-                name: name.trim(),
-                goal,
-                wake,
-                sleep,
-                startingPoint,
-                targetGoal,
-                bodyFatDirection: bodyFatDirection as Profile["bodyFatDirection"],
-                experienceLevel:  experienceLevel  as Profile["experienceLevel"],
-                equipment:        equipment         as Profile["equipment"],
-                workoutFrequency: workoutFrequency  as Profile["workoutFrequency"],
-                dailyTrainingTime:dailyTrainingTime as Profile["dailyTrainingTime"],
-              };
-              setProfile(p);
-              setAuthed(true);
-              setTab("Today");
-              generatePlanFromProfileAndSchedule(p, []);
-            }}
-          />
-          <Pressable onPress={() => setOnboardingStep(4)} style={{ alignItems: "center", paddingVertical: 10 }}>
-            <Text style={styles.miniNote}>← Back</Text>
-          </Pressable>
-        </ScrollView>
-      </SafeAreaView>
+      <OnboardingFlow
+        onComplete={(result) => {
+          setProfile(result);
+          setAuthed(true);
+          setTab("Home");
+          // Use the same Aira Intelligence bridge as generateAIPlan (regeneration path).
+          // Onboarding profile is always fully-formed — no normalisation needed, but
+          // normalizeProfileForPlanning guards against edge cases in old stored shapes.
+          const safeResult = normalizeProfileForPlanning(result) ?? result;
+          try {
+            const { aiPlan: newAiPlan, tasks: newTasks } = generateLocalAiraPlan(safeResult);
+            setAiPlan(newAiPlan);
+            setTasks(newTasks);
+            scheduleFromTasks(newTasks);
+            AsyncStorage.setItem(STORE.aiPlan, JSON.stringify(newAiPlan)).catch(console.warn);
+            // programPlan and tasks auto-persist via their useEffect watchers
+            const today = new Date().toISOString().slice(0, 10);
+            setProgramPlan({ generatedDate: today, days: [{ dayIndex: 0, tasks: newTasks }] });
+            console.log("[onboarding] generateLocalAiraPlan success — tasks:", newTasks.length);
+          } catch (err) {
+            console.error("[onboarding] generateLocalAiraPlan error:", err);
+            // Fallback: rule-based plan so Today screen is not empty after onboarding
+            generatePlanFromProfileAndSchedule(result, []);
+            const gp = generateDailyPlan(safeResult);
+            setGeneratedPlan(gp);
+            setAiPlan(synthesizeAIPlan(gp));
+            AsyncStorage.setItem(STORE.generatedPlan, JSON.stringify(gp)).catch(console.warn);
+          }
+        }}
+      />
     );
   }
 
@@ -4238,6 +7203,53 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
 
       // Keep AI plan backend in sync when a plan is active (best-effort)
       if (aiPlan) syncAIPlanTask(id, willBeCompleted);
+
+      // Dismiss inactivity nudge on first interaction
+      if (showStartNudge) setShowStartNudge(false);
+
+      // Streak reinforcement message — shown briefly after each toggle
+      if (completionMsgTimerRef.current) clearTimeout(completionMsgTimerRef.current);
+      if (willBeCompleted) {
+        const prevDone = tasks.filter((t) => t.done).length;
+        const newDone  = prevDone + 1;
+        const total    = tasks.length;
+        let msg: string;
+        if (newDone === total) {
+          msg = "You showed up today. This is who you are.";
+        } else if (newDone === 1 && liveStreak > 0) {
+          msg = "Streak alive.";
+        } else if (newDone === 1) {
+          msg = "This is what disciplined people do.";
+        } else if (newDone === 2) {
+          msg = liveStreak >= 5 ? "You're becoming consistent." : "You're building momentum.";
+        } else if (newDone === 3) {
+          msg = "This is part of your identity now.";
+        } else {
+          msg = "This is how streaks are built.";
+        }
+        setCompletionMsg(msg);
+        completionMsgTimerRef.current = setTimeout(() => setCompletionMsg(null), 3500);
+      } else {
+        setCompletionMsg(null);
+      }
+
+      // Update cumulative behavior patterns for every task (not just high-priority)
+      if (task) {
+        const slot = task.timeMin < 720 ? "morning" : task.timeMin < 1020 ? "afternoon" : "evening";
+        setBehaviorPatterns((prev) => {
+          const kindDone    = { ...prev.kindDone };
+          const kindUndone  = { ...prev.kindUndone };
+          const workoutSlots = { ...prev.workoutSlots };
+          if (willBeCompleted) {
+            kindDone[task.kind] = (kindDone[task.kind] ?? 0) + 1;
+            if (task.kind === "Workout") workoutSlots[slot]++;
+          } else {
+            kindUndone[task.kind] = (kindUndone[task.kind] ?? 0) + 1;
+            if (task.kind === "Workout") workoutSlots[slot] = Math.max(0, (workoutSlots[slot] ?? 0) - 1);
+          }
+          return { kindDone, kindUndone, workoutSlots };
+        });
+      }
 
       // Record feedback for high-priority tasks only.
       // completed: true  → positive signal (done)
@@ -4278,56 +7290,89 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
     // Mock fallback — only active in dev builds when no real data is present.
     const isMockActive   = __DEV__ && DEV_MOCK_ENABLED && !aiPlanLoading && !aiPlanError && aiPlan === null && tasks.length === 0;
     const effectivePlan  = isMockActive ? DEV_MOCK_PLAN  : aiPlan;
-    const effectiveTasks = isMockActive ? DEV_MOCK_TASKS : rebalancedTasks;
+    // Task priority: mock > manual adaptation > in-day rebalance > energy adaptation > base rebalanced
+    const effectiveTasks = isMockActive ? DEV_MOCK_TASKS : (adaptedTasks ?? inDayRebalancedTasks ?? energyAdaptation.modifiedTasks);
     const effectiveScore = isMockActive ? calcScore(DEV_MOCK_TASKS) : score;
 
-    const doneCount  = effectiveTasks.filter((t) => t.done).length;
-    const totalCount = effectiveTasks.length;
-    const allDone    = totalCount > 0 && doneCount === totalCount;
+    const doneCount    = effectiveTasks.filter((t) => t.done).length;
+    const totalCount   = effectiveTasks.length;
+    const allDone      = totalCount > 0 && doneCount === totalCount;
+    const nextTaskId   = effectiveTasks.find((t) => !t.done)?.id ?? null;
     const dateStr    = new Date().toLocaleDateString("en-US", {
       weekday: "long", month: "long", day: "numeric",
     });
 
-    // ── Loading ────────────────────────────────────────────────────────────────
+    // ── Loading — skeleton cards instead of spinner ────────────────────────────
     if (aiPlanLoading) {
       return (
-        <View style={{ flex: 1, justifyContent: "center", alignItems: "center", gap: 18 }}>
-          <View style={{
-            width: 52,
-            height: 52,
-            borderRadius: 26,
-            borderWidth: 1,
-            borderColor: ACCENT + "28",
-            backgroundColor: ACCENT + "08",
-            alignItems: "center",
-            justifyContent: "center",
-          }}>
-            <ActivityIndicator color={ACCENT} size="small" />
+        <ScrollView
+          style={{ flex: 1 }}
+          contentContainerStyle={{ paddingBottom: 48 }}
+          showsVerticalScrollIndicator={false}
+          scrollEnabled={false}
+        >
+          {/* Header skeleton */}
+          <View style={{ paddingBottom: 24 }}>
+            <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+              <View style={{ gap: 6 }}>
+                <Text style={{ color: "#ffffff", fontSize: 28, fontWeight: "700", letterSpacing: -0.5 }}>Today</Text>
+                <View style={{ height: 10, width: 160, borderRadius: 5, backgroundColor: "rgba(255,255,255,0.04)" }} />
+              </View>
+              <View style={{ width: 32, height: 32, borderRadius: 10, backgroundColor: "#0c0c18", borderWidth: 1, borderColor: "#1c1c2e" }} />
+            </View>
           </View>
-          <View style={{ alignItems: "center", gap: 5 }}>
-            <Text style={{ color: "#d0d0d8", fontSize: 15, fontWeight: "700" }}>Building your plan</Text>
-            <Text style={{ color: "#505060", fontSize: 12, fontWeight: "500" }}>Personalising to your day…</Text>
+          {/* Score ring skeleton */}
+          <View style={{ alignItems: "center", marginBottom: 28 }}>
+            <View style={{
+              width: 140, height: 140, borderRadius: 70,
+              borderWidth: 10, borderColor: "rgba(255,255,255,0.04)",
+              alignItems: "center", justifyContent: "center",
+            }}>
+              <View style={{ height: 36, width: 56, borderRadius: 8, backgroundColor: "rgba(255,255,255,0.05)" }} />
+            </View>
           </View>
-        </View>
+          {/* Today's focus skeleton */}
+          <SkeletonCard height={66} radius={16} />
+          <View style={{ marginBottom: 16 }} />
+          {/* Task row skeletons */}
+          <View style={{ marginBottom: 4 }}>
+            <View style={{ height: 10, width: 80, borderRadius: 5, backgroundColor: "rgba(255,255,255,0.04)", marginBottom: 12 }} />
+            <SkeletonTaskRow />
+            <SkeletonTaskRow />
+            <SkeletonTaskRow />
+            <SkeletonTaskRow />
+          </View>
+          {/* Building label — subtle, at the bottom */}
+          <View style={{ alignItems: "center", marginTop: 16, gap: 4 }}>
+            <Text style={{ color: "#282840", fontSize: 11, fontWeight: "600", letterSpacing: 0.4 }}>Building your plan…</Text>
+          </View>
+        </ScrollView>
       );
     }
 
     return (
       <ScrollView
         style={{ flex: 1 }}
-        contentContainerStyle={{ paddingBottom: 56 }}
+        contentContainerStyle={{ paddingBottom: 48 }}
         showsVerticalScrollIndicator={false}
+        maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
       >
 
         {/* ── Header ─────────────────────────────────────────────────────────── */}
-        <View style={{ paddingBottom: 20 }}>
-          <Text style={{ color: "#fff", fontSize: 30, fontWeight: "800", letterSpacing: -0.5 }}>Today</Text>
-          <Text style={{ color: "#555", fontSize: 12, fontWeight: "600", marginTop: 3, letterSpacing: 0.2 }}>{dateStr}</Text>
-          {profile?.name ? (
-            <Text style={{ color: "#606075", fontSize: 13, marginTop: 5, fontWeight: "500" }}>
-              {getGreeting()}, {profile.name}.
-            </Text>
-          ) : null}
+        <View style={{ paddingBottom: 24 }}>
+          <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+            <View style={{ gap: 3 }}>
+              <Text style={{ color: "#ffffff", fontSize: 28, fontWeight: "700", letterSpacing: -0.5 }}>Today</Text>
+              <Text style={{ color: "#34344a", fontSize: 11, fontWeight: "500", letterSpacing: 0.3 }}>
+                {dateStr}{profile?.profile?.firstName ? `  ·  ${new Date().getHours() < 12 ? "Morning" : new Date().getHours() < 17 ? "Afternoon" : "Evening"}, ${profile.profile?.firstName}` : ""}
+              </Text>
+            </View>
+            <Pressable onPress={() => setOverlay("settings")} style={{ padding: 8, marginRight: -4 }}>
+              <View style={{ width: 32, height: 32, borderRadius: 10, backgroundColor: "#0c0c18", borderWidth: 1, borderColor: "#1c1c2e", alignItems: "center", justifyContent: "center" }}>
+                <Text style={{ color: "#404058", fontSize: 14 }}>⊕</Text>
+              </View>
+            </Pressable>
+          </View>
           {isMockActive && (
             <View style={{ marginTop: 10, backgroundColor: "#1a1000", borderWidth: 1, borderColor: "#3a2800", borderRadius: 6, paddingHorizontal: 8, paddingVertical: 4, alignSelf: "flex-start" }}>
               <Text style={{ color: "#8a6400", fontSize: 10, fontWeight: "800", letterSpacing: 0.8 }}>DEV · MOCK DATA</Text>
@@ -4335,66 +7380,402 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
           )}
         </View>
 
-        {/* ── Score anchor ────────────────────────────────────────────────────── */}
-        {totalCount > 0 && (
+        {/* ── Command banner — auto-dismisses after 3.5s ─────────────────────── */}
+        {commandBanner && (
           <View style={{
-            backgroundColor: "#09090f",
+            backgroundColor: "#060610",
             borderWidth: 1,
-            borderColor: "#20203a",
-            borderRadius: 18,
-            padding: 22,
-            marginBottom: 12,
+            borderColor: planLocked ? ACCENT + "60" : "#2a2a50",
+            borderRadius: 12,
+            paddingHorizontal: 14,
+            paddingVertical: 10,
+            marginBottom: 10,
+            flexDirection: "row",
+            alignItems: "center",
+            gap: 10,
           }}>
-            <View style={{ flexDirection: "row", alignItems: "flex-end", justifyContent: "space-between" }}>
-              {/* Score */}
-              <View style={{ gap: 6 }}>
-                <Text style={{
-                  color: effectiveScore >= 80 ? "#66bb6a" : "#ffffff",
-                  fontSize: 54,
-                  fontWeight: "900",
-                  letterSpacing: -2,
-                  lineHeight: 54,
-                }}>
-                  {effectiveScore}
-                </Text>
-                <Text style={{ color: "#50507a", fontSize: 10, fontWeight: "800", letterSpacing: 1.2 }}>
-                  DISCIPLINE SCORE
-                </Text>
+            <View style={{
+              width: 6, height: 6, borderRadius: 3,
+              backgroundColor: planLocked ? ACCENT : ACCENT + "80",
+              shadowColor: ACCENT, shadowOpacity: planLocked ? 0.5 : 0.2,
+              shadowRadius: 6, shadowOffset: { width: 0, height: 0 },
+            }} />
+            <Text style={{ flex: 1, color: "#9898c8", fontSize: 12, fontWeight: "700", lineHeight: 17 }}>
+              {commandBanner}
+            </Text>
+            {planLocked && (
+              <View style={{ backgroundColor: ACCENT + "18", borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3 }}>
+                <Text style={{ color: ACCENT + "cc", fontSize: 9, fontWeight: "900", letterSpacing: 0.8 }}>LOCKED</Text>
               </View>
+            )}
+          </View>
+        )}
 
-              {/* Streak */}
-              <View style={{ alignItems: "flex-end", gap: 6 }}>
-                <Text style={{
-                  color: liveStreak > 0 ? ACCENT : "#30303e",
-                  fontSize: 34,
-                  fontWeight: "900",
-                  letterSpacing: -1,
-                  lineHeight: 34,
-                }}>
-                  {liveStreak}
-                </Text>
-                <Text style={{ color: "#50507a", fontSize: 10, fontWeight: "800", letterSpacing: 1.2 }}>
-                  DAY STREAK
-                </Text>
-              </View>
-            </View>
+        {/* ── Plan locked indicator (persistent when no command banner) ─────── */}
+        {planLocked && !commandBanner && (
+          <Pressable
+            onPress={() => handlePlanAction("LOCK_PLAN")}
+            style={{
+              backgroundColor: "#07070f",
+              borderWidth: 1,
+              borderColor: ACCENT + "35",
+              borderRadius: 10,
+              paddingHorizontal: 12,
+              paddingVertical: 8,
+              marginBottom: 10,
+              flexDirection: "row",
+              alignItems: "center",
+              gap: 8,
+            }}
+          >
+            <View style={{ width: 5, height: 5, borderRadius: 3, backgroundColor: ACCENT + "60" }} />
+            <Text style={{ flex: 1, color: "#6060a0", fontSize: 11, fontWeight: "700" }}>Plan locked — tap to unlock</Text>
+            <Text style={{ color: ACCENT + "50", fontSize: 10, fontWeight: "900", letterSpacing: 0.6 }}>LOCKED</Text>
+          </Pressable>
+        )}
 
-            {/* Progress bar */}
-            <View style={{ marginTop: 18, gap: 8 }}>
-              <View style={{ height: 3, backgroundColor: "#13132a", borderRadius: 2, overflow: "hidden" }}>
-                <View style={{
-                  height: 3,
-                  width: `${Math.round((doneCount / totalCount) * 100)}%` as any,
-                  backgroundColor: allDone ? "#66bb6a" : ACCENT,
-                  borderRadius: 2,
-                }} />
-              </View>
-              <Text style={{ color: "#50506a", fontSize: 11, fontWeight: "600" }}>
-                {allDone
-                  ? "All tasks complete"
-                  : `${doneCount} of ${totalCount} complete`}
+        {/* ── Energy adaptation notice — shown when plan was silently modified ── */}
+        {energyAdaptation.message && adaptedTasks === null && !commandBanner && !adaptBanner && (
+          <View style={{
+            backgroundColor: energyState === "HIGH" ? "#06100a" : "#100a06",
+            borderWidth: 1,
+            borderColor: energyState === "HIGH" ? "#4CAF5030" : "#FF980030",
+            borderRadius: 12,
+            paddingHorizontal: 14,
+            paddingVertical: 10,
+            marginBottom: 10,
+            flexDirection: "row",
+            alignItems: "center",
+            gap: 10,
+          }}>
+            <Text style={{ fontSize: 12, lineHeight: 1 }}>
+              {energyState === "HIGH" ? "⚡" : "↓"}
+            </Text>
+            <Text style={{
+              flex: 1,
+              color: energyState === "HIGH" ? "#4CAF5099" : "#FF980099",
+              fontSize: 12,
+              fontWeight: "700",
+              lineHeight: 17,
+            }}>
+              {energyAdaptation.message}
+            </Text>
+          </View>
+        )}
+
+        {/* ── System nudge — subtle one-line signal when plan silently adjusts ── */}
+        {systemNudge && !adaptBanner && !commandBanner && !(energyAdaptation.message && adaptedTasks === null) && (
+          <Animated.View style={{ opacity: nudgeFadeAnim, marginBottom: 10 }}>
+            <Pressable
+              onPress={() => setSystemNudge(null)}
+              style={{
+                backgroundColor: "#08080f",
+                borderWidth: 1,
+                borderColor: "#2a2a50",
+                borderRadius: 10,
+                paddingHorizontal: 14,
+                paddingVertical: 9,
+                flexDirection: "row",
+                alignItems: "center",
+                gap: 9,
+              }}
+            >
+              <View style={{ width: 4, height: 4, borderRadius: 2, backgroundColor: "#5050a0" }} />
+              <Text style={{ flex: 1, color: "#6868a8", fontSize: 12, fontWeight: "600", lineHeight: 17 }}>
+                {systemNudge}
+              </Text>
+              <Text style={{ color: "#303050", fontSize: 11, fontWeight: "700" }}>✕</Text>
+            </Pressable>
+          </Animated.View>
+        )}
+
+        {/* ── Adaptive Day Engine banner ──────────────────────────────────────── */}
+        {adaptBanner && (
+          <Pressable
+            onPress={() => {
+              setAdaptBanner(null);
+              if (adaptBanner.trigger !== "low_completion") setAdaptedTasks(null);
+            }}
+            style={{
+              backgroundColor: "#09091a",
+              borderWidth: 1,
+              borderColor: ACCENT + "45",
+              borderRadius: 14,
+              paddingHorizontal: 16,
+              paddingVertical: 12,
+              marginBottom: 14,
+              flexDirection: "row",
+              alignItems: "center",
+              gap: 12,
+              shadowColor: ACCENT,
+              shadowOpacity: 0.2,
+              shadowRadius: 18,
+              shadowOffset: { width: 0, height: 4 },
+              elevation: 5,
+            }}
+          >
+            <View style={{
+              width: 6, height: 6, borderRadius: 3,
+              backgroundColor: ACCENT,
+              shadowColor: ACCENT, shadowOpacity: 0.5, shadowRadius: 6, shadowOffset: { width: 0, height: 0 },
+            }} />
+            <View style={{ flex: 1, gap: 3 }}>
+              <Text style={{ color: ACCENT + "cc", fontSize: 9, fontWeight: "900", letterSpacing: 1.4 }}>PLAN ADJUSTED</Text>
+              <Text style={{ color: "#9898c0", fontSize: 12, fontWeight: "600", lineHeight: 18 }}>
+                {adaptBanner.message}
               </Text>
             </View>
+            <Text style={{ color: "#404060", fontSize: 12, fontWeight: "700" }}>✕</Text>
+          </Pressable>
+        )}
+
+        {/* ── SAVE YOUR DAY — streak protection banner ────────────────────────── */}
+        {saveTheDay.trigger && (
+          <Pressable
+            onPress={() => {
+              // Tapping navigates to the task's detail modal
+              if (saveTheDay.taskId) {
+                const task = effectiveTasks.find((t) => t.id === saveTheDay.taskId);
+                if (task) {
+                  if (task.kind === "Workout")        setWorkoutTask(task);
+                  else if (task.kind === "Nutrition") setNutritionTask(task);
+                  else if (task.kind === "Recovery")  setRecoveryTask(task);
+                  else if (task.kind === "Habit")     setHabitTask(task);
+                  else                                setDetailTask(task);
+                }
+              }
+            }}
+            style={({ pressed }) => ({
+              backgroundColor: pressed ? "#100810" : "#0c0610",
+              borderWidth: 1.5,
+              borderColor: "#FF525260",
+              borderRadius: 16,
+              padding: 18,
+              marginBottom: 14,
+              gap: 8,
+              shadowColor: "#FF5252",
+              shadowOpacity: pressed ? 0.1 : 0.28,
+              shadowRadius: 24,
+              shadowOffset: { width: 0, height: 5 },
+              elevation: 7,
+            })}
+          >
+            {/* Header */}
+            <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 7 }}>
+                <View style={{
+                  width: 7, height: 7, borderRadius: 3.5,
+                  backgroundColor: "#FF5252",
+                  shadowColor: "#FF5252", shadowOpacity: 0.7, shadowRadius: 6, shadowOffset: { width: 0, height: 0 },
+                }} />
+                <Text style={{ color: "#FF5252cc", fontSize: 9, fontWeight: "900", letterSpacing: 1.8 }}>SAVE YOUR DAY</Text>
+              </View>
+              <Pressable
+                onPress={(e) => { e.stopPropagation(); setSaveTheDayDismissed(true); }}
+                hitSlop={10}
+              >
+                <Text style={{ color: "#404058", fontSize: 14, fontWeight: "700" }}>✕</Text>
+              </Pressable>
+            </View>
+
+            {/* Action — the one thing to do */}
+            <Text style={{
+              color:       "#f0d0d0",
+              fontSize:    16,
+              fontWeight:  "800",
+              lineHeight:  23,
+              letterSpacing: -0.3,
+            }}>
+              {saveTheDay.action}
+            </Text>
+
+            {/* Reason */}
+            <Text style={{
+              color:      "#805858",
+              fontSize:   12,
+              fontWeight: "600",
+              lineHeight: 18,
+            }}>
+              {saveTheDay.reason}
+            </Text>
+          </Pressable>
+        )}
+
+        {/* ── Score ring ──────────────────────────────────────────────────────── */}
+        <View style={{
+          alignItems: "center",
+          paddingTop: 32, paddingBottom: 44,
+          marginHorizontal: -16, paddingHorizontal: 16,
+          backgroundColor: "#03030a",
+        }}>
+          <CircularProgressRing score={effectiveScore} />
+
+          {/* Streak row */}
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 6, marginTop: 20 }}>
+            {liveStreak > 0 ? (
+              <>
+                <Text style={{ fontSize: 13 }}>🔥</Text>
+                <Text style={{ color: "#d0d0e8", fontSize: 13, fontWeight: "600", letterSpacing: -0.1 }}>
+                  Locked In · Day {liveStreak}
+                </Text>
+              </>
+            ) : (
+              <Text style={{ color: "#2e2e48", fontSize: 12, fontWeight: "500", letterSpacing: 0.3 }}>
+                Start your streak today
+              </Text>
+            )}
+          </View>
+
+          {/* Task progress subtext */}
+          <Text style={{ color: "#2a2a44", fontSize: 11, fontWeight: "500", marginTop: 6, letterSpacing: 0.3 }}>
+            {totalCount > 0
+              ? allDone
+                ? `${totalCount}/${totalCount} complete ✓`
+                : `${doneCount} of ${totalCount} tasks done`
+              : "No plan yet — tap check-in to begin"}
+          </Text>
+
+          {/* Streak reinforcement message — appears briefly after task toggle */}
+          {completionMsg && (
+            <Text style={{
+              color:         completionMsg.startsWith("You showed up") ? "#66bb6a" : "#7B61FF",
+              fontSize:      12,
+              fontWeight:    "700",
+              marginTop:     10,
+              letterSpacing: 0.2,
+              textShadowColor:  completionMsg.startsWith("You showed up") ? "#66bb6a44" : "#7B61FF44",
+              textShadowRadius: 8,
+              textShadowOffset: { width: 0, height: 0 },
+            }}>
+              {completionMsg}
+            </Text>
+          )}
+        </View>
+
+        {/* ── Streak risk banner — shows late in the day if streak is endangered ── */}
+        {liveStreak > 0 && doneCount === 0 && new Date().getHours() >= 19 && (
+          <View style={{
+            backgroundColor: "#0d0608",
+            borderWidth: 1,
+            borderColor: "#ff4d4d30",
+            borderRadius: 14,
+            paddingHorizontal: 16,
+            paddingVertical: 12,
+            flexDirection: "row",
+            alignItems: "center",
+            gap: 10,
+          }}>
+            <View style={{
+              width: 6, height: 6, borderRadius: 3,
+              backgroundColor: "#ff4d4d",
+              shadowColor: "#ff4d4d", shadowOpacity: 0.6, shadowRadius: 6, shadowOffset: { width: 0, height: 0 },
+            }} />
+            <Text style={{ color: "#cc5555", fontSize: 12, fontWeight: "700", flex: 1 }}>
+              Your streak is at risk — get one task done.
+            </Text>
+          </View>
+        )}
+
+        {/* ── Adaptive triggers — passive suggestions (user taps to activate) ─── */}
+        {/* Low completion at midday */}
+        {totalCount > 0 && doneCount === 0 && new Date().getHours() >= 12 && !allDone && !adaptBanner && (
+          <Pressable
+            onPress={() => triggerAdaptation("low_completion")}
+            style={{
+              backgroundColor: "#09090f",
+              borderWidth: 1,
+              borderColor: "#2a2a3e",
+              borderRadius: 14,
+              paddingHorizontal: 16,
+              paddingVertical: 13,
+              marginBottom: 10,
+              flexDirection: "row",
+              alignItems: "center",
+              gap: 12,
+            }}
+          >
+            <View style={{ flex: 1, gap: 3 }}>
+              <Text style={{ color: "#606080", fontSize: 9, fontWeight: "900", letterSpacing: 1.4 }}>MIDDAY CHECK</Text>
+              <Text style={{ color: "#7878a0", fontSize: 12, fontWeight: "600" }}>Nothing done yet — tap to get a reset nudge.</Text>
+            </View>
+            <Text style={{ color: "#404060", fontSize: 10, fontWeight: "700" }}>→</Text>
+          </Pressable>
+        )}
+
+        {/* Missed workout window */}
+        {(() => {
+          const nowMin = new Date().getHours() * 60 + new Date().getMinutes();
+          const missedWorkout = effectiveTasks.find(
+            (t) => t.kind === "Workout" && !t.done && t.timeMin + 90 < nowMin
+          );
+          if (!missedWorkout || adaptBanner?.trigger === "missed_workout") return null;
+          return (
+            <Pressable
+              onPress={() => triggerAdaptation("missed_workout")}
+              style={{
+                backgroundColor: "#09090f",
+                borderWidth: 1,
+                borderColor: "#2a2a3e",
+                borderRadius: 14,
+                paddingHorizontal: 16,
+                paddingVertical: 13,
+                marginBottom: 10,
+                flexDirection: "row",
+                alignItems: "center",
+                gap: 12,
+              }}
+            >
+              <View style={{ flex: 1, gap: 3 }}>
+                <Text style={{ color: "#606080", fontSize: 9, fontWeight: "900", letterSpacing: 1.4 }}>WORKOUT WINDOW PASSED</Text>
+                <Text style={{ color: "#7878a0", fontSize: 12, fontWeight: "600" }}>Tap to move it up — 30 min still counts.</Text>
+              </View>
+              <Text style={{ color: "#404060", fontSize: 10, fontWeight: "700" }}>→</Text>
+            </Pressable>
+          );
+        })()}
+
+        {/* ── End-of-day identity card — shown when all tasks complete ──────────── */}
+        {allDone && totalCount > 0 && (
+          <View style={{
+            backgroundColor: "#060e08",
+            borderWidth: 1,
+            borderColor: "#66bb6a40",
+            borderRadius: 18,
+            paddingHorizontal: 22,
+            paddingVertical: 20,
+            gap: 10,
+            shadowColor: "#66bb6a",
+            shadowOpacity: 0.22,
+            shadowRadius: 28,
+            shadowOffset: { width: 0, height: 4 },
+            elevation: 6,
+          }}>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 7 }}>
+              <View style={{
+                width: 6, height: 6, borderRadius: 3,
+                backgroundColor: "#66bb6a",
+                shadowColor: "#66bb6a", shadowOpacity: 0.6, shadowRadius: 6, shadowOffset: { width: 0, height: 0 },
+              }} />
+              <Text style={{ color: "#66bb6acc", fontSize: 9, fontWeight: "900", letterSpacing: 1.8 }}>
+                DAY COMPLETE
+              </Text>
+            </View>
+            <Text style={{ color: "#a8e8a8", fontSize: 16, fontWeight: "800", lineHeight: 23, letterSpacing: -0.3 }}>
+              You showed up today.
+            </Text>
+            <Text style={{ color: "#3d6640", fontSize: 12, fontWeight: "600", lineHeight: 18 }}>
+              {getIdentityLabel(liveStreak).label} · Stay consistent. Show up tomorrow.
+            </Text>
+          </View>
+        )}
+
+        {/* ── Schedule context note — shown when plan was built around real blocks ── */}
+        {schedulePlanNote && aiPlan && (
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 6, marginBottom: 10 }}>
+            <View style={{ width: 3, height: 3, borderRadius: 2, backgroundColor: "#3a3a58" }} />
+            <Text style={{ color: "#3a3a58", fontSize: 11, fontWeight: "600", letterSpacing: 0.2 }}>
+              {schedulePlanNote}
+            </Text>
           </View>
         )}
 
@@ -4402,57 +7783,101 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
         {gamePlan ? (
           <Pressable
             onPress={() => setShowMotivation(true)}
-            style={{
-              backgroundColor: gamePlan.color + "0a",
+            style={({ pressed }) => ({
+              overflow: "hidden",
               borderWidth: 1,
-              borderColor: gamePlan.color + "22",
-              borderRadius: 14,
-              padding: 14,
-              marginBottom: 12,
-              flexDirection: "row",
-              alignItems: "center",
-              gap: 10,
-            }}
+              borderColor: "rgba(255,255,255,0.07)",
+              borderRadius: 16,
+              marginBottom: 16,
+              shadowColor: gamePlan.color,
+              shadowOpacity: 0.08,
+              shadowRadius: 16,
+              shadowOffset: { width: 0, height: 4 },
+              elevation: 4,
+              opacity:   pressed ? 0.88 : 1,
+              transform: [{ scale: pressed ? 0.988 : 1 }],
+            })}
           >
-            <View style={{ flex: 1, gap: 7 }}>
-              <View style={{ flexDirection: "row", gap: 6 }}>
-                <View style={{ backgroundColor: gamePlan.color + "18", borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3 }}>
-                  <Text style={{ color: gamePlan.color, fontSize: 10, fontWeight: "900", letterSpacing: 0.8 }}>
+            <View style={{ padding: 16, flexDirection: "row", alignItems: "center", gap: 10, backgroundColor: "rgba(255,255,255,0.03)" }}>
+            <View style={{ flex: 1, gap: 8 }}>
+              <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+                <Text style={{ color: "#2e2e48", fontSize: 9, fontWeight: "900", letterSpacing: 1.4 }}>
+                  GAME PLAN
+                </Text>
+                <View style={{ backgroundColor: gamePlan.color + "18", borderRadius: 5, paddingHorizontal: 8, paddingVertical: 3 }}>
+                  <Text style={{ color: gamePlan.color + "dd", fontSize: 9, fontWeight: "900", letterSpacing: 1 }}>
                     {gamePlan.readiness.toUpperCase()}
                   </Text>
                 </View>
-                <View style={{ backgroundColor: "#181818", borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3 }}>
-                  <Text style={{ color: "#666", fontSize: 10, fontWeight: "800", letterSpacing: 0.8 }}>
-                    {gamePlan.timeMode.toUpperCase()}
-                  </Text>
-                </View>
               </View>
-              <Text style={{ color: "#aaa", fontSize: 13, lineHeight: 19, fontWeight: "500" }} numberOfLines={3}>
+              <Text style={{ color: "#b0b0cc", fontSize: 13, lineHeight: 21, fontWeight: "500", letterSpacing: 0 }} numberOfLines={2}>
                 {gamePlan.message}
               </Text>
+              {readinessState && (
+                <View style={{
+                  flexDirection: "row", alignItems: "center", gap: 6,
+                  paddingTop: 8,
+                  borderTopWidth: 1,
+                  borderTopColor: "#1a1a2c",
+                  marginTop: 4,
+                }}>
+                  <View style={{
+                    width: 5, height: 5, borderRadius: 2.5,
+                    backgroundColor:
+                      readinessState.readiness === "PUSH"    ? "#66bb6a" :
+                      readinessState.readiness === "RECOVER" ? "#FF9800" :
+                      ACCENT,
+                  }} />
+                  <Text style={{
+                    color:
+                      readinessState.readiness === "PUSH"    ? "#66bb6a99" :
+                      readinessState.readiness === "RECOVER" ? "#FF980099" :
+                      ACCENT + "99",
+                    fontSize:    10,
+                    fontWeight:  "700",
+                    letterSpacing: 0.4,
+                    flex: 1,
+                  }}>
+                    {readinessState.readiness === "PUSH"    ? "Push day — " :
+                     readinessState.readiness === "RECOVER" ? "Recover day — " :
+                     "Build day — "}
+                    {readinessState.reason}
+                  </Text>
+                </View>
+              )}
             </View>
-            <Text style={{ color: "#404050", fontSize: 18 }}>›</Text>
+            <Text style={{ color: ACCENT + "55", fontSize: 18 }}>›</Text>
+            </View>
           </Pressable>
         ) : (
           <Pressable
             onPress={() => setShowMotivation(true)}
             style={{
-              backgroundColor: "#0b0b12",
+              backgroundColor: ACCENT + "0c",
               borderWidth: 1,
-              borderColor: "#1a1a28",
-              borderRadius: 14,
-              padding: 14,
-              marginBottom: 12,
+              borderColor: ACCENT + "35",
+              borderRadius: 16,
+              padding: 16,
+              marginBottom: 16,
               flexDirection: "row",
               alignItems: "center",
               justifyContent: "space-between",
+              shadowColor: ACCENT,
+              shadowOpacity: 0.1,
+              shadowRadius: 14,
+              shadowOffset: { width: 0, height: 0 },
+              elevation: 4,
             }}
           >
-            <View style={{ gap: 4 }}>
-              <Text style={{ color: ACCENT + "cc", fontSize: 10, fontWeight: "900", letterSpacing: 0.8 }}>TODAY'S GAME PLAN</Text>
-              <Text style={{ color: "#555", fontSize: 13 }}>Complete check-in to set today's direction.</Text>
+            <View style={{ gap: 5 }}>
+              <Text style={{ color: ACCENT, fontSize: 13, fontWeight: "800", letterSpacing: -0.2 }}>
+                Lock in your plan for today.
+              </Text>
+              <Text style={{ color: ACCENT + "90", fontSize: 11, fontWeight: "600" }}>
+                Tap to start check-in →
+              </Text>
             </View>
-            <Text style={{ color: ACCENT + "88", fontSize: 18 }}>›</Text>
+            <Text style={{ color: ACCENT, fontSize: 20, fontWeight: "800" }}>›</Text>
           </Pressable>
         )}
 
@@ -4462,14 +7887,14 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
             backgroundColor: "#100808",
             borderWidth: 1,
             borderColor: "#2a1010",
-            borderRadius: 14,
-            padding: 16,
-            marginBottom: 12,
+            borderRadius: 16,
+            padding: 18,
+            marginBottom: 16,
             gap: 10,
           }}>
             <Text style={{ color: "#ff5252", fontSize: 10, fontWeight: "900", letterSpacing: 0.8 }}>PLAN ERROR</Text>
             <Text style={{ color: "#996060", fontSize: 13, lineHeight: 19 }}>{aiPlanError}</Text>
-            <Pressable onPress={generateAIPlan}>
+            <Pressable onPress={() => generateAIPlan()}>
               <Text style={{ color: ACCENT, fontSize: 13, fontWeight: "700" }}>Try again →</Text>
             </Pressable>
           </View>
@@ -4478,88 +7903,431 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
         {/* ── Plan exists ─────────────────────────────────────────────────────── */}
         {effectivePlan && !aiPlanError && (
           <>
-            {/* Day focus summary */}
+            {/* ── Intelligence header ───────────────────────────────────────────
+                Three tiers of information pulled from the Aira-generated plan:
+                  1. disciplineTarget — primary daily focus (large, bold)
+                  2. summary          — why today's plan is structured this way
+                  3. Confidence line  — subtle static reminder that the plan is personalised
+            */}
             <View style={{
-              backgroundColor: "#09091a",
+              backgroundColor: "rgba(255,255,255,0.04)",
               borderWidth: 1,
-              borderColor: "#16162e",
-              borderRadius: 14,
-              padding: 16,
-              marginBottom: 12,
-              gap: 7,
+              borderColor: "rgba(255,255,255,0.06)",
+              borderLeftWidth: 3,
+              borderLeftColor: ACCENT + "70",
+              borderRadius: 16,
+              paddingVertical: 16,
+              paddingHorizontal: 16,
+              marginBottom: 20,
+              gap: 10,
+              shadowColor: ACCENT,
+              shadowOpacity: 0.06,
+              shadowRadius: 20,
+              shadowOffset: { width: 0, height: 6 },
+              elevation: 4,
             }}>
-              <Text style={{ color: "#5050a0", fontSize: 10, fontWeight: "800", letterSpacing: 1 }}>TODAY'S FOCUS</Text>
-              <Text style={{ color: "#a8a8c0", fontSize: 13, lineHeight: 21, fontWeight: "500" }}>{effectivePlan.summary}</Text>
+              {/* Label */}
+              <Text style={{ color: "#32324e", fontSize: 9, fontWeight: "900", letterSpacing: 1.6 }}>TODAY&apos;S FOCUS</Text>
+
+              {/* Primary — discipline target (large, bold) */}
+              <Text style={{ color: "#dcdcf4", fontSize: 17, lineHeight: 25, fontWeight: "700", letterSpacing: -0.4 }}>
+                {effectivePlan.disciplineTarget}
+              </Text>
+
+              {/* Secondary — Aira plan summary (what & why) */}
+              {effectivePlan.summary ? (
+                <Text style={{ color: "#8888a8", fontSize: 13, lineHeight: 20, fontWeight: "500", letterSpacing: 0 }}>
+                  {effectivePlan.summary}
+                </Text>
+              ) : null}
+
+              {/* Divider */}
+              <View style={{ height: 1, backgroundColor: "rgba(255,255,255,0.04)", marginTop: 2 }} />
+
+              {/* Confidence line — subtle, low-opacity */}
+              <Text style={{ color: "#34344e", fontSize: 11, lineHeight: 17, fontWeight: "500", letterSpacing: 0.1 }}>
+                Personalised to your goals, schedule, and recovery.
+              </Text>
             </View>
           </>
         )}
 
+        {/* ── NEXT MOVE card — real-time decision engine ───────────────────────── */}
+        {nextBestAction && !allDone && (
+          <Pressable
+            onPress={() => {
+              if (!nextBestAction.taskId) return;
+              const task = effectiveTasks.find((t) => t.id === nextBestAction.taskId);
+              if (!task) return;
+              if (task.kind === "Workout")        setWorkoutTask(task);
+              else if (task.kind === "Nutrition") setNutritionTask(task);
+              else if (task.kind === "Recovery")  setRecoveryTask(task);
+              else if (task.kind === "Habit")     setHabitTask(task);
+              else                                setDetailTask(task);
+            }}
+            style={({ pressed }) => ({
+              backgroundColor: "rgba(255,255,255,0.04)",
+              borderWidth: 1,
+              borderColor: "rgba(255,255,255,0.07)",
+              borderRadius: 16,
+              padding: 16,
+              marginBottom: 16,
+              gap: 6,
+              shadowColor: "#000",
+              shadowOpacity: 0.18,
+              shadowRadius: 16,
+              shadowOffset: { width: 0, height: 6 },
+              elevation: 5,
+              opacity:   pressed ? 0.88 : 1,
+              transform: [{ scale: pressed ? 0.985 : 1 }],
+            })}
+          >
+            <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+              <Text style={{ color: ACCENT + "aa", fontSize: 9, fontWeight: "900", letterSpacing: 1.6 }}>NEXT MOVE</Text>
+              <Text style={{ color: ACCENT + "44", fontSize: 11, fontWeight: "700" }}>→</Text>
+            </View>
+            <Text style={{ color: "#dcdcf0", fontSize: 14, fontWeight: "600", letterSpacing: -0.2, lineHeight: 22 }}>
+              {nextBestAction.label}
+            </Text>
+            <Text style={{ color: "#4a4a70", fontSize: 12, fontWeight: "500", lineHeight: 20 }}>
+              {nextBestAction.reason}
+            </Text>
+          </Pressable>
+        )}
+
+        {/* ── WIN CONDITION — daily success framework ──────────────────────────── */}
+        {winCondition && !allDone && (
+          <View style={{
+            backgroundColor: "#070710",
+            borderWidth: 1,
+            borderColor: "#131326",
+            borderRadius: 16,
+            padding: 16,
+            marginBottom: 16,
+            gap: 10,
+            shadowColor: "#000",
+            shadowOpacity: 0.25,
+            shadowRadius: 10,
+            shadowOffset: { width: 0, height: 2 },
+            elevation: 3,
+          }}>
+            <Text style={{ color: "#30304e", fontSize: 9, fontWeight: "900", letterSpacing: 1.6 }}>WIN CONDITION</Text>
+
+            {/* Primary — must happen */}
+            <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 10 }}>
+              <View style={{
+                width: 6, height: 6, borderRadius: 3,
+                backgroundColor: "#4CAF5080",
+                marginTop: 6,
+                flexShrink: 0,
+              }} />
+              <View style={{ flex: 1, gap: 1 }}>
+                <Text style={{ color: "#383858", fontSize: 9, fontWeight: "800", letterSpacing: 0.8 }}>MUST DO</Text>
+                <Text style={{ color: "#c0c0dc", fontSize: 14, fontWeight: "700", lineHeight: 20, letterSpacing: -0.1 }}>
+                  {winCondition.primary}
+                </Text>
+              </View>
+            </View>
+
+            {/* Secondary — key outcome */}
+            {winCondition.secondary && (
+              <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 10 }}>
+                <View style={{
+                  width: 6, height: 6, borderRadius: 3,
+                  backgroundColor: ACCENT + "60",
+                  marginTop: 6,
+                  flexShrink: 0,
+                }} />
+                <View style={{ flex: 1, gap: 1 }}>
+                  <Text style={{ color: "#383858", fontSize: 9, fontWeight: "800", letterSpacing: 0.8 }}>KEY OUTCOME</Text>
+                  <Text style={{ color: "#9898b8", fontSize: 13, fontWeight: "500", lineHeight: 19 }}>
+                    {winCondition.secondary}
+                  </Text>
+                </View>
+              </View>
+            )}
+
+            {/* Flex — nice to have */}
+            {winCondition.flex && winCondition.flex.length > 0 && (
+              <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 10, paddingTop: 2 }}>
+                <View style={{
+                  width: 6, height: 6, borderRadius: 3,
+                  backgroundColor: "#2c2c48",
+                  marginTop: 6,
+                  flexShrink: 0,
+                }} />
+                <Text style={{ color: "#404060", fontSize: 12, fontWeight: "500", lineHeight: 18, flex: 1 }}>
+                  If time allows: {winCondition.flex.join(", ")}.
+                </Text>
+              </View>
+            )}
+          </View>
+        )}
+
+        {/* ── Why this plan — schedule/context rationale ──────────────────────── */}
+        {(() => {
+          if (!effectivePlan) return null;
+          const rationale = buildPlanRationale(effectiveTasks, blocks, gamePlan, patternInsights);
+          if (!rationale) return null;
+          return (
+            <View style={{
+              flexDirection: "row",
+              alignItems:    "flex-start",
+              gap:           10,
+              marginBottom:  16,
+            }}>
+              <View style={{
+                width: 2, alignSelf: "stretch",
+                backgroundColor: ACCENT + "28",
+                borderRadius: 1,
+              }} />
+              <Text style={{
+                color:      "#484868",
+                fontSize:   12,
+                fontWeight: "500",
+                lineHeight: 18,
+                flex:       1,
+                fontStyle:  "italic",
+              }}>
+                {rationale}
+              </Text>
+            </View>
+          );
+        })()}
+
+        {/* ── Aira Insight — predictive coaching before failure happens ────────── */}
+        {predictiveInsights.length > 0 && effectivePlan && (
+          <View style={{ gap: 6, marginBottom: 16 }}>
+            {predictiveInsights.map((insight) => {
+              const isUrgent   = insight.key === "streak_risk";
+              const modeColor  = COACH_MODE_META[coachMode].color;
+              const accentColor = isUrgent ? "#FF5252" : modeColor;
+              return (
+                <View
+                  key={insight.key}
+                  style={{
+                    backgroundColor: isUrgent ? "#0c070a" : "#07070f",
+                    borderWidth: 1,
+                    borderColor: accentColor + "1c",
+                    borderRadius: 14,
+                    paddingHorizontal: 14,
+                    paddingVertical: 12,
+                    gap: 5,
+                  }}
+                >
+                  <Text style={{
+                    color: accentColor + "60",
+                    fontSize: 9,
+                    fontWeight: "900",
+                    letterSpacing: 1.4,
+                  }}>
+                    AIRA · {insight.label}
+                  </Text>
+                  <Text style={{ color: "#707088", fontSize: 12, fontWeight: "500", lineHeight: 18 }}>
+                    {insight.message}
+                  </Text>
+                  {insight.action && (
+                    <Pressable
+                      onPress={() => triggerAdaptation(insight.action!.trigger)}
+                      style={{ marginTop: 2, alignSelf: "flex-start" }}
+                    >
+                      <Text style={{
+                        color: accentColor + "cc",
+                        fontSize: 11,
+                        fontWeight: "700",
+                        letterSpacing: 0.2,
+                      }}>
+                        {insight.action.label} →
+                      </Text>
+                    </Pressable>
+                  )}
+                </View>
+              );
+            })}
+          </View>
+        )}
+
         {/* ── Task list ───────────────────────────────────────────────────────── */}
         {totalCount > 0 ? (
-          <View style={{ gap: 7, marginBottom: 24 }}>
+          <View style={{ gap: 14, marginBottom: 44 }}>
             {/* Section header */}
             <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
-              <Text style={{ color: "#50507a", fontSize: 10, fontWeight: "800", letterSpacing: 1 }}>
-                TODAY'S TASKS
+              <Text style={{ color: "#34345e", fontSize: 9, fontWeight: "700", letterSpacing: 1.8 }}>
+                TASKS
               </Text>
               {pausedCount > 0 && (
-                <Text style={{ color: "#3a3a55", fontSize: 10, fontWeight: "600" }}>
-                  {pausedCount} paused · {gamePlan?.timeMode}
+                <Text style={{ color: "#2e2e48", fontSize: 10, fontWeight: "600", letterSpacing: 0.2 }}>
+                  {pausedCount} paused
                 </Text>
               )}
             </View>
 
-            {effectiveTasks.map((task) => (
-              <TaskRow
-                key={task.id}
-                task={task}
-                onToggle={() => toggleTask(task.id)}
-                onDetail={() => {
-                  if (task.kind === "Workout")        setWorkoutTask(task);
-                  else if (task.kind === "Nutrition") setNutritionTask(task);
-                  else if (task.kind === "Recovery")  setRecoveryTask(task);
-                  else if (task.kind === "Habit")     setHabitTask(task);
-                  else setDetailTask(task);
-                }}
-              />
-            ))}
+            {(() => {
+              // ── Day-section grouping ─────────────────────────────────────────
+              // Only show MORNING / AFTERNOON / EVENING headers when tasks span
+              // at least two periods — keeps single-period days uncluttered.
+              const NOON = 12 * 60;
+              const EVE  = 17 * 60;
+              const periods = [
+                effectiveTasks.some((t) => t.timeMin < NOON),
+                effectiveTasks.some((t) => t.timeMin >= NOON && t.timeMin < EVE),
+                effectiveTasks.some((t) => t.timeMin >= EVE),
+              ];
+              const multiPeriod = periods.filter(Boolean).length > 1;
+
+              const sections = multiPeriod
+                ? [
+                    { key: "morning",   label: "MORNING",   tasks: effectiveTasks.filter((t) => t.timeMin < NOON) },
+                    { key: "afternoon", label: "AFTERNOON", tasks: effectiveTasks.filter((t) => t.timeMin >= NOON && t.timeMin < EVE) },
+                    { key: "evening",   label: "EVENING",   tasks: effectiveTasks.filter((t) => t.timeMin >= EVE) },
+                  ].filter((s) => s.tasks.length > 0)
+                : [{ key: "all", label: null, tasks: effectiveTasks }];
+
+              // ── Per-task renderer (preserves isNext / quick-complete logic) ──
+              const renderTask = (task: TimedTask) => {
+                const isNext = task.id === nextTaskId;
+                const taskRow = (
+                  <TaskRow
+                    task={task}
+                    isNext={isNext}
+                    onToggle={() => toggleTask(task.id)}
+                    onDetail={() => {
+                      if (task.kind === "Workout")        setWorkoutTask(task);
+                      else if (task.kind === "Nutrition") setNutritionTask(task);
+                      else if (task.kind === "Recovery")  setRecoveryTask(task);
+                      else if (task.kind === "Habit")     setHabitTask(task);
+                      else setDetailTask(task);
+                    }}
+                  />
+                );
+                if (!isNext) return <React.Fragment key={task.id}>{taskRow}</React.Fragment>;
+                return (
+                  <View key={task.id}>
+                    <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 5 }}>
+                      <Text style={{ color: ACCENT + "99", fontSize: 9, fontWeight: "900", letterSpacing: 1.4 }}>
+                        {showStartNudge ? "→ START HERE NOW" : "START HERE"}
+                      </Text>
+                      {showStartNudge && (
+                        <Text style={{ color: ACCENT + "55", fontSize: 9, fontWeight: "700", letterSpacing: 0.8 }}>
+                          tap to complete ↓
+                        </Text>
+                      )}
+                    </View>
+                    {taskRow}
+                    {/* Quick-complete strip — 1-tap completion for the next task */}
+                    <Pressable
+                      onPress={() => toggleTask(task.id)}
+                      style={({ pressed }) => ({
+                        marginTop: 6,
+                        backgroundColor: ACCENT + "0e",
+                        borderWidth: 1,
+                        borderColor: ACCENT + "28",
+                        borderRadius: 14,
+                        paddingVertical: 11,
+                        alignItems: "center",
+                        flexDirection: "row",
+                        justifyContent: "center",
+                        gap: 8,
+                        opacity:   pressed ? 0.78 : 1,
+                        transform: [{ scale: pressed ? 0.97 : 1 }],
+                      })}
+                    >
+                      <View style={{
+                        width: 14, height: 14, borderRadius: 7,
+                        borderWidth: 1.5, borderColor: ACCENT + "80",
+                        alignItems: "center", justifyContent: "center",
+                      }} />
+                      <Text style={{ color: ACCENT + "e0", fontSize: 12, fontWeight: "800", letterSpacing: 0.3 }}>
+                        Mark complete
+                      </Text>
+                    </Pressable>
+                  </View>
+                );
+              };
+
+              // ── Render sections ──────────────────────────────────────────────
+              return sections.map(({ key, label, tasks: sectionTasks }, si) => (
+                <View key={key} style={si > 0 ? { marginTop: 12 } : undefined}>
+                  {label && (
+                    <View style={{
+                      flexDirection: "row", alignItems: "center", gap: 10,
+                      marginBottom: 10, marginTop: si === 0 ? 0 : 14,
+                    }}>
+                      <Text style={{ color: "#2a2a44", fontSize: 9, fontWeight: "700", letterSpacing: 1.6 }}>
+                        {label}
+                      </Text>
+                      <View style={{ flex: 1, height: 1, backgroundColor: "#0e0e1c" }} />
+                    </View>
+                  )}
+                  <View style={{ gap: 12 }}>
+                    {sectionTasks.map(renderTask)}
+                  </View>
+                </View>
+              ));
+            })()}
 
           </View>
         ) : (
           /* ── Empty state ──────────────────────────────────────────────────── */
-          <View style={{ alignItems: "center", paddingTop: 48, paddingBottom: 48, gap: 16 }}>
+          <View style={{ alignItems: "center", paddingTop: 52, paddingBottom: 52, gap: 18 }}>
             <View style={{
-              width: 56,
-              height: 56,
-              borderRadius: 28,
+              width: 60,
+              height: 60,
+              borderRadius: 30,
               borderWidth: 1,
-              borderColor: ACCENT + "22",
-              backgroundColor: ACCENT + "06",
+              borderColor: ACCENT + "30",
+              backgroundColor: ACCENT + "08",
               alignItems: "center",
               justifyContent: "center",
+              shadowColor: ACCENT,
+              shadowOpacity: 0.1,
+              shadowRadius: 16,
+              shadowOffset: { width: 0, height: 0 },
             }}>
-              <Text style={{ color: ACCENT + "60", fontSize: 22 }}>◎</Text>
+              <Text style={{ color: ACCENT + "70", fontSize: 24 }}>◎</Text>
             </View>
             <View style={{ alignItems: "center", gap: 6 }}>
-              <Text style={{ color: "#ccc", fontSize: 15, fontWeight: "700" }}>No plan yet</Text>
-              <Text style={{ color: "#444", fontSize: 13, textAlign: "center", lineHeight: 20, maxWidth: 240 }}>
-                {gamePlan
-                  ? "Your check-in is done. Generate your plan to see today's tasks."
-                  : "Complete your daily check-in first, then generate a plan."}
+              <Text style={{ color: "#d0d0d8", fontSize: 16, fontWeight: "700", letterSpacing: -0.2 }}>
+                {effectivePlan
+                  ? "Let's build momentum."
+                  : gamePlan ? "Ready to build your plan." : "Set your direction first."}
+              </Text>
+              <Text style={{ color: "#505060", fontSize: 13, textAlign: "center", lineHeight: 21, maxWidth: 240 }}>
+                {effectivePlan
+                  ? "Aira is preparing your plan. Stay consistent."
+                  : gamePlan
+                    ? "Check-in complete. Generate your plan to start executing."
+                    : "Complete your daily check-in, then generate a plan."}
               </Text>
             </View>
             {gamePlan ? (
               <Pressable
-                onPress={generateAIPlan}
-                style={{
+                onPress={aiPlanLoading ? undefined : () => generateAIPlan()}
+                style={({ pressed }) => ({
                   marginTop: 4,
-                  backgroundColor: ACCENT,
                   borderRadius: 14,
-                  paddingVertical: 15,
-                  paddingHorizontal: 32,
-                }}
+                  overflow: "hidden",
+                  shadowColor: "#7B61FF",
+                  shadowOpacity: aiPlanLoading ? 0.25 : pressed ? 0.65 : 0.5,
+                  shadowRadius: 20,
+                  shadowOffset: { width: 0, height: 6 },
+                  elevation: 8,
+                  opacity: aiPlanLoading ? 0.7 : pressed ? 0.92 : 1,
+                  transform: [{ scale: aiPlanLoading ? 1 : pressed ? 0.97 : 1 }],
+                })}
               >
-                <Text style={{ color: "#fff", fontSize: 14, fontWeight: "800", letterSpacing: 0.2 }}>Generate today's plan</Text>
+                <LinearGradient
+                  colors={["#5e7fff", "#7B61FF", "#a855f7"]}
+                  start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }}
+                  style={{ paddingVertical: 15, paddingHorizontal: 32, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8 }}
+                >
+                  {aiPlanLoading
+                    ? <ActivityIndicator color="rgba(255,255,255,0.7)" size="small" />
+                    : null}
+                  <Text style={{ color: aiPlanLoading ? "rgba(255,255,255,0.6)" : "#fff", fontSize: 14, fontWeight: "800", letterSpacing: 0.2 }}>
+                    {aiPlanLoading ? "Building…" : "Generate today's plan"}
+                  </Text>
+                </LinearGradient>
               </Pressable>
             ) : (
               <Pressable
@@ -4568,10 +8336,15 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
                   marginTop: 4,
                   backgroundColor: "#0e0e1c",
                   borderWidth: 1,
-                  borderColor: ACCENT + "30",
+                  borderColor: ACCENT + "40",
                   borderRadius: 14,
                   paddingVertical: 15,
                   paddingHorizontal: 32,
+                  shadowColor: ACCENT,
+                  shadowOpacity: 0.15,
+                  shadowRadius: 10,
+                  shadowOffset: { width: 0, height: 3 },
+                  elevation: 4,
                 }}
               >
                 <Text style={{ color: ACCENT, fontSize: 14, fontWeight: "800", letterSpacing: 0.2 }}>Start check-in</Text>
@@ -4582,32 +8355,226 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
 
         {/* ── Coaching note + fallback ────────────────────────────────────────── */}
         {effectivePlan && (
-          <View style={{ gap: 8, marginTop: 4 }}>
-            {/* Coaching note card */}
-            <View style={{
-              backgroundColor: "#09090f",
-              borderWidth: 1,
-              borderColor: "#18182e",
-              borderRadius: 14,
-              padding: 15,
-              gap: 7,
-            }}>
-              <Text style={{ color: "#5050a0", fontSize: 10, fontWeight: "800", letterSpacing: 1 }}>COACHING NOTE</Text>
-              <Text style={{ color: "#8888a8", fontSize: 13, lineHeight: 20, fontWeight: "500" }}>{effectivePlan.coachingNote}</Text>
-            </View>
+          <View style={{ gap: 12, marginTop: 8 }}>
+            {/* Coaching note card — border + label tinted to coach mode */}
+            {(() => {
+              const modeMeta = COACH_MODE_META[coachMode];
+              return (
+                <View style={{
+                  backgroundColor: "rgba(255,255,255,0.04)",
+                  borderWidth: 1,
+                  borderColor: "rgba(255,255,255,0.06)",
+                  borderRadius: 16,
+                  padding: 16,
+                  gap: 8,
+                  shadowColor: "#000",
+                  shadowOpacity: 0.18,
+                  shadowRadius: 16,
+                  shadowOffset: { width: 0, height: 6 },
+                  elevation: 4,
+                }}>
+                  <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+                    <Text style={{ color: "#303060", fontSize: 9, fontWeight: "900", letterSpacing: 1.6 }}>AIRA</Text>
+                    <View style={{
+                      backgroundColor: modeMeta.color + "14",
+                      borderRadius: 6,
+                      paddingHorizontal: 7,
+                      paddingVertical: 2,
+                    }}>
+                      <Text style={{ color: modeMeta.color + "cc", fontSize: 8, fontWeight: "900", letterSpacing: 0.8 }}>
+                        {modeMeta.label}
+                      </Text>
+                    </View>
+                  </View>
+                  <Text style={{ color: "#8888a8", fontSize: 13, lineHeight: 21, fontWeight: "500", letterSpacing: 0 }}>{effectivePlan.coachingNote}</Text>
+                </View>
+              );
+            })()}
+
+            {/* Pattern coaching card — only shown when Aira has learned something */}
+            {patternCoachingLine && (
+              <View style={{
+                backgroundColor: "#06060d",
+                borderWidth: 1,
+                borderColor: ACCENT + "22",
+                borderRadius: 16,
+                padding: 18,
+                gap: 6,
+              }}>
+                <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+                  <Text style={{ color: ACCENT + "55", fontSize: 9, fontWeight: "900", letterSpacing: 1.4 }}>AIRA LEARNS</Text>
+                  {userMemory.consistencyScore > 0 && (
+                    <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
+                      <View style={{
+                        width: 28,
+                        height: 4,
+                        borderRadius: 2,
+                        backgroundColor: "#1a1a30",
+                        overflow: "hidden",
+                      }}>
+                        <View style={{
+                          width: `${userMemory.consistencyScore}%`,
+                          height: "100%",
+                          backgroundColor: userMemory.consistencyScore >= 70 ? "#4CAF50" : userMemory.consistencyScore >= 40 ? ACCENT : "#FF5252",
+                          borderRadius: 2,
+                        }} />
+                      </View>
+                      <Text style={{
+                        color: userMemory.consistencyScore >= 70 ? "#4CAF5099" : userMemory.consistencyScore >= 40 ? ACCENT + "88" : "#FF525299",
+                        fontSize: 9,
+                        fontWeight: "800",
+                        letterSpacing: 0.6,
+                      }}>{userMemory.consistencyScore}%</Text>
+                    </View>
+                  )}
+                </View>
+                <Text style={{ color: "#8888aa", fontSize: 13, lineHeight: 20, fontWeight: "500" }}>{patternCoachingLine}</Text>
+              </View>
+            )}
 
             {/* Fallback card */}
             <View style={{
-              backgroundColor: "#08080c",
+              backgroundColor: "#050508",
               borderWidth: 1,
-              borderColor: "#141420",
+              borderColor: "#0e0e1c",
+              borderLeftWidth: 2,
+              borderLeftColor: "#242440",
               borderRadius: 14,
-              padding: 15,
-              gap: 7,
+              paddingVertical: 12,
+              paddingHorizontal: 14,
+              gap: 5,
             }}>
-              <Text style={{ color: "#40405a", fontSize: 10, fontWeight: "800", letterSpacing: 1 }}>IF THE DAY FALLS APART</Text>
-              <Text style={{ color: "#505065", fontSize: 13, lineHeight: 20, fontStyle: "italic" }}>{effectivePlan.fallbackPlan}</Text>
+              <Text style={{ color: "#28283e", fontSize: 9, fontWeight: "900", letterSpacing: 1.6 }}>FALLBACK</Text>
+              <Text style={{ color: "#505068", fontSize: 12, lineHeight: 19, fontStyle: "italic" }}>{effectivePlan.fallbackPlan}</Text>
             </View>
+
+            {/* DAY REVIEW card — visible after 8 PM or when all tasks are done */}
+            {dayEvaluation && (() => {
+              const statusMeta: Record<DayEvalStatus, { color: string; label: string; icon: string }> = {
+                WIN:     { color: "#4CAF50", label: "WIN",     icon: "◆" },
+                PARTIAL: { color: "#FFB300", label: "PARTIAL", icon: "◈" },
+                MISS:    { color: "#FF5252", label: "MISS",    icon: "◇" },
+              };
+              const meta = statusMeta[dayEvaluation.status];
+              return (
+                <View style={{
+                  backgroundColor: "#060610",
+                  borderWidth: 1.5,
+                  borderColor: meta.color + "40",
+                  borderRadius: 16,
+                  padding: 18,
+                  gap: 10,
+                  shadowColor: meta.color,
+                  shadowOpacity: 0.08,
+                  shadowRadius: 16,
+                  shadowOffset: { width: 0, height: 0 },
+                }}>
+                  {/* Header */}
+                  <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+                    <Text style={{ color: "#505070", fontSize: 9, fontWeight: "900", letterSpacing: 1.6 }}>DAY REVIEW</Text>
+                    <View style={{
+                      flexDirection: "row", alignItems: "center", gap: 5,
+                      backgroundColor: meta.color + "16",
+                      borderRadius: 6,
+                      paddingHorizontal: 8,
+                      paddingVertical: 3,
+                    }}>
+                      <Text style={{ color: meta.color, fontSize: 9, fontWeight: "900" }}>{meta.icon}</Text>
+                      <Text style={{ color: meta.color + "cc", fontSize: 9, fontWeight: "900", letterSpacing: 1 }}>{meta.label}</Text>
+                    </View>
+                  </View>
+
+                  {/* Evaluation message */}
+                  <Text style={{
+                    color: dayEvaluation.status === "WIN" ? "#d0e8d0" : dayEvaluation.status === "PARTIAL" ? "#d8c880" : "#c88888",
+                    fontSize: 14,
+                    fontWeight: "700",
+                    lineHeight: 21,
+                    letterSpacing: -0.1,
+                  }}>
+                    {dayEvaluation.message}
+                  </Text>
+
+                  {/* Tomorrow focus */}
+                  {dayEvaluation.focusTomorrow && (
+                    <View style={{
+                      flexDirection: "row", alignItems: "flex-start", gap: 8,
+                      borderTopWidth: 1,
+                      borderTopColor: "#1a1a2c",
+                      paddingTop: 10,
+                    }}>
+                      <Text style={{ color: ACCENT + "60", fontSize: 11, fontWeight: "700", marginTop: 1 }}>→</Text>
+                      <View style={{ flex: 1, gap: 1 }}>
+                        <Text style={{ color: "#404060", fontSize: 9, fontWeight: "800", letterSpacing: 0.8 }}>TOMORROW</Text>
+                        <Text style={{ color: "#7878a8", fontSize: 12, fontWeight: "600", lineHeight: 18 }}>
+                          {dayEvaluation.focusTomorrow}
+                        </Text>
+                      </View>
+                    </View>
+                  )}
+                </View>
+              );
+            })()}
+
+            {/* TOMORROW STARTS WITH card — surfaces alongside day evaluation */}
+            {tomorrowPrep && (
+              <View style={{
+                backgroundColor: "#07070e",
+                borderWidth: 1,
+                borderColor: ACCENT + "30",
+                borderRadius: 16,
+                padding: 18,
+                gap: 8,
+              }}>
+                <Text style={{ color: ACCENT + "70", fontSize: 9, fontWeight: "900", letterSpacing: 1.6 }}>TOMORROW STARTS WITH</Text>
+
+                {/* Primary focus */}
+                <Text style={{
+                  color:       "#c8c8e8",
+                  fontSize:    14,
+                  fontWeight:  "800",
+                  lineHeight:  21,
+                  letterSpacing: -0.2,
+                }}>
+                  {tomorrowPrep.primaryFocus}
+                </Text>
+
+                {/* Prep action */}
+                {tomorrowPrep.prepAction && (
+                  <View style={{
+                    flexDirection: "row",
+                    alignItems:    "flex-start",
+                    gap:           8,
+                    paddingTop:    2,
+                  }}>
+                    <Text style={{ color: "#4CAF5080", fontSize: 11, fontWeight: "700", marginTop: 1 }}>✓</Text>
+                    <Text style={{
+                      flex:       1,
+                      color:      "#606080",
+                      fontSize:   12,
+                      fontWeight: "600",
+                      lineHeight: 18,
+                    }}>
+                      {tomorrowPrep.prepAction}
+                    </Text>
+                  </View>
+                )}
+
+                {/* Carry-over reason */}
+                {tomorrowPrep.carryOverReason && (
+                  <Text style={{
+                    color:      "#3c3c58",
+                    fontSize:   11,
+                    fontWeight: "500",
+                    lineHeight: 17,
+                    fontStyle:  "italic",
+                    marginTop:  2,
+                  }}>
+                    {tomorrowPrep.carryOverReason}
+                  </Text>
+                )}
+              </View>
+            )}
 
           </View>
         )}
@@ -4620,29 +8587,240 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
         {/* ── No AI plan but has local tasks — show generate nudge ────────────── */}
         {!effectivePlan && !aiPlanError && totalCount > 0 && (
           <Pressable
-            onPress={generateAIPlan}
-            style={{
+            onPress={aiPlanLoading ? undefined : () => generateAIPlan()}
+            style={({ pressed }) => ({
               marginTop: 8,
               backgroundColor: ACCENT + "14",
               borderWidth: 1,
-              borderColor: ACCENT + "35",
-              borderRadius: 14,
-              padding: 16,
+              borderColor: ACCENT + "40",
+              borderRadius: 16,
+              padding: 18,
               alignItems: "center",
               gap: 3,
-            }}
+              shadowColor: ACCENT,
+              shadowOpacity: 0.12,
+              shadowRadius: 10,
+              shadowOffset: { width: 0, height: 3 },
+              elevation: 3,
+              opacity: aiPlanLoading ? 0.5 : pressed ? 0.82 : 1,
+              transform: [{ scale: aiPlanLoading ? 1 : pressed ? 0.985 : 1 }],
+            })}
           >
-            <Text style={{ color: ACCENT, fontSize: 13, fontWeight: "800" }}>Generate AI plan →</Text>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+              {aiPlanLoading && <ActivityIndicator color={ACCENT} size="small" />}
+              <Text style={{ color: aiPlanLoading ? ACCENT + "70" : ACCENT, fontSize: 13, fontWeight: "800" }}>
+                {aiPlanLoading ? "Building…" : "Generate AI plan →"}
+              </Text>
+            </View>
             <Text style={{ color: ACCENT + "80", fontSize: 11, fontWeight: "500" }}>Replaces the local plan with a personalised one</Text>
           </Pressable>
         )}
 
-        {/* ── Regenerate nudge when plan exists ─────────────────────────────── */}
+        {/* ── Refine My Day — regenerate button when plan exists ──────────────── */}
         {effectivePlan && !isMockActive && totalCount > 0 && (
-          <Pressable onPress={generateAIPlan} style={{ alignSelf: "flex-start", paddingVertical: 6, marginTop: 6 }}>
-            <Text style={{ color: "#383848", fontSize: 12, fontWeight: "700" }}>Regenerate plan →</Text>
+          <Pressable
+            onPress={aiPlanLoading ? undefined : () => generateAIPlan()}
+            style={({ pressed }) => ({
+              marginTop: 16,
+              backgroundColor: aiPlanLoading ? "#080810" : "#0d0d1e",
+              borderWidth: 1,
+              borderColor: aiPlanLoading ? ACCENT + "20" : ACCENT + "30",
+              borderRadius: 16,
+              paddingVertical: 14,
+              paddingHorizontal: 20,
+              alignItems: "center",
+              gap: 5,
+              opacity: aiPlanLoading ? 0.65 : pressed ? 0.88 : 1,
+              transform: [{ scale: aiPlanLoading ? 1 : pressed ? 0.985 : 1 }],
+              shadowColor: ACCENT,
+              shadowOpacity: aiPlanLoading ? 0 : 0.08,
+              shadowRadius: 12,
+              shadowOffset: { width: 0, height: 4 },
+              elevation: 3,
+            })}
+          >
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+              {aiPlanLoading && <ActivityIndicator color={ACCENT + "80"} size="small" />}
+              <Text style={{
+                color:         aiPlanLoading ? ACCENT + "50" : ACCENT + "cc",
+                fontSize:      13,
+                fontWeight:    "800",
+                letterSpacing: 0.2,
+              }}>
+                {aiPlanLoading ? "Refining…" : "Refine My Day"}
+              </Text>
+            </View>
+            <Text style={{ color: "#262640", fontSize: 11, fontWeight: "500", letterSpacing: 0.1 }}>
+              Adjusts your plan based on your current state
+            </Text>
           </Pressable>
         )}
+
+        {/* ── Hub previews ───────────────────────────────────────────────────── */}
+        <View style={{ marginTop: 20, gap: 14 }}>
+
+          {/* Schedule preview — horizontal timeline */}
+          <View>
+            <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+              <Text style={{ color: "#2a2a44", fontSize: 9, fontWeight: "700", letterSpacing: 1.8 }}>SCHEDULE</Text>
+              <Pressable onPress={() => setOverlay("schedule")} hitSlop={8}>
+                <Text style={{ color: "#303050", fontSize: 11, fontWeight: "700", letterSpacing: 0.2 }}>Manage →</Text>
+              </Pressable>
+            </View>
+            {blocks.length > 0 ? (
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginHorizontal: -2 }}>
+                <View style={{ flexDirection: "row", gap: 8, paddingHorizontal: 2, paddingBottom: 4 }}>
+                  {blocks.map((b) => {
+                    const accentColor = (() => {
+                      if (b.type === "Work")    return ACCENT;
+                      if (b.type === "School")  return "#42a5f5";
+                      if (b.type === "Kids")    return "#66bb6a";
+                      if (b.type === "Commute") return "#ffa040";
+                      return "#7B61FF";
+                    })();
+                    // Very faint Aira tint per type — purely atmospheric
+                    const gradColors: [string, string, string] = (() => {
+                      if (b.type === "Work")    return ["#00D1FF07", "#7B61FF0a", "#7B61FF05"];
+                      if (b.type === "School")  return ["#00D1FF07", "#42a5f50a", "#42a5f505"];
+                      if (b.type === "Kids")    return ["#4CAF5007", "#00D1FF09", "#4CAF5004"];
+                      if (b.type === "Commute") return ["#ffa04009", "#FF3D9A07", "#ffa04004"];
+                      return ["#7B61FF07", "#FF3D9A08", "#7B61FF04"];
+                    })();
+                    return (
+                      <LinearGradient
+                        key={b.id}
+                        colors={gradColors}
+                        start={{ x: 0, y: 0 }}
+                        end={{ x: 1, y: 1 }}
+                        style={{
+                          borderWidth:     1,
+                          borderColor:     "rgba(255,255,255,0.07)",
+                          borderLeftWidth: 3,
+                          borderLeftColor: accentColor + "90",
+                          borderRadius:    14,
+                          paddingVertical: 13,
+                          paddingHorizontal: 14,
+                          minWidth:        128,
+                          gap:             5,
+                          shadowColor:     "#000",
+                          shadowOpacity:   0.18,
+                          shadowRadius:    16,
+                          shadowOffset:    { width: 0, height: 6 },
+                          elevation:       3,
+                        }}
+                      >
+                        <Text style={{ color: "#cccce0", fontSize: 12, fontWeight: "800", letterSpacing: -0.1 }} numberOfLines={1}>
+                          {b.title}
+                        </Text>
+                        <Text style={{ color: accentColor + "70", fontSize: 10, fontWeight: "700", letterSpacing: 0.2 }}>
+                          {b.startText} – {b.endText}
+                        </Text>
+                      </LinearGradient>
+                    );
+                  })}
+                </View>
+              </ScrollView>
+            ) : (
+              <Pressable
+                onPress={() => setOverlay("schedule")}
+                style={{
+                  backgroundColor: "#06060e",
+                  borderWidth: 1,
+                  borderColor: "#111120",
+                  borderRadius: 12,
+                  paddingVertical: 16,
+                  alignItems: "center",
+                }}
+              >
+                <Text style={{ color: "#252540", fontSize: 12, fontWeight: "700" }}>Add schedule blocks →</Text>
+              </Pressable>
+            )}
+          </View>
+
+          {/* Nutrition + Recovery — side by side */}
+          <View style={{ flexDirection: "row", gap: 10 }}>
+
+            {/* Nutrition preview */}
+            {(() => {
+              const nutritionTasks = effectiveTasks.filter((t) => t.kind === "Nutrition");
+              const nutritionDone  = nutritionTasks.filter((t) => t.done).length;
+              const hasNutrition   = nutritionTasks.length > 0;
+              return (
+                <Pressable
+                  onPress={() => {
+                    const first = nutritionTasks.find((t) => !t.done) ?? nutritionTasks[0];
+                    if (first) setNutritionTask(first);
+                    // no-op when no tasks — card still gives visual feedback via press style
+                  }}
+                  style={({ pressed }) => ({
+                    flex: 1,
+                    backgroundColor: "rgba(255,255,255,0.04)",
+                    borderWidth: 1,
+                    borderColor: "rgba(255,255,255,0.06)",
+                    borderLeftWidth: 3,
+                    borderLeftColor: hasNutrition ? "#4CAF5060" : "#4CAF5025",
+                    borderRadius: 14,
+                    padding: 14,
+                    gap: 4,
+                    shadowColor: "#000",
+                    shadowOpacity: 0.18,
+                    shadowRadius: 16,
+                    shadowOffset: { width: 0, height: 6 },
+                    elevation: 3,
+                    opacity:   pressed && hasNutrition ? 0.82 : 1,
+                    transform: [{ scale: pressed && hasNutrition ? 0.985 : 1 }],
+                  })}
+                >
+                  <Text style={{ color: "#243d30", fontSize: 9, fontWeight: "700", letterSpacing: 1.8 }}>NUTRITION</Text>
+                  <Text style={{ color: hasNutrition ? "#b0b0c8" : "#303048", fontSize: 13, fontWeight: "600", marginTop: 3, letterSpacing: -0.1 }}>
+                    {hasNutrition
+                      ? `${nutritionDone}/${nutritionTasks.length} tracked`
+                      : effectivePlan ? "No meals planned" : "Awaiting plan"}
+                  </Text>
+                  <Text style={{ color: "#2a3830", fontSize: 10, fontWeight: "600" }} numberOfLines={1}>
+                    {hasNutrition
+                      ? (nutritionTasks.find((t) => !t.done)?.title ?? "All done ✓")
+                      : effectivePlan ? "Plan has no meals" : "—"}
+                  </Text>
+                </Pressable>
+              );
+            })()}
+
+            {/* Recovery preview */}
+            <Pressable
+              onPress={() => setShowMotivation(true)}
+              style={({ pressed }) => ({
+                flex: 1,
+                backgroundColor: "rgba(255,255,255,0.04)",
+                borderWidth: 1,
+                borderColor: "rgba(255,255,255,0.06)",
+                borderLeftWidth: 3,
+                borderLeftColor: ACCENT + "55",
+                borderRadius: 14,
+                padding: 14,
+                gap: 4,
+                shadowColor: "#000",
+                shadowOpacity: 0.18,
+                shadowRadius: 16,
+                shadowOffset: { width: 0, height: 6 },
+                elevation: 3,
+                opacity:   pressed ? 0.82 : 1,
+                transform: [{ scale: pressed ? 0.985 : 1 }],
+              })}
+            >
+              <Text style={{ color: "#26243e", fontSize: 9, fontWeight: "700", letterSpacing: 1.8 }}>RECOVERY</Text>
+              <Text style={{ color: "#b0b0c8", fontSize: 13, fontWeight: "600", marginTop: 3, letterSpacing: -0.1 }}>
+                {gamePlan ? gamePlan.readiness : "Not set"}
+              </Text>
+              <Text style={{ color: "#282840", fontSize: 10, fontWeight: "600" }} numberOfLines={1}>
+                {recovery.energyLevel ? `Energy: ${recovery.energyLevel}` : "Tap to check in"}
+              </Text>
+            </Pressable>
+
+          </View>
+
+        </View>
+
       </ScrollView>
     );
   };
@@ -4654,7 +8832,29 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
     const [blockStart, setBlockStart] = useState("9:00 AM");
     const [blockEnd, setBlockEnd] = useState("5:00 PM");
 
+    const TYPE_DEFAULTS: Record<BlockType, { start: string; end: string }> = {
+      Work:    { start: "9:00 AM",  end: "5:00 PM"  },
+      School:  { start: "8:00 AM",  end: "3:00 PM"  },
+      Kids:    { start: "3:00 PM",  end: "6:00 PM"  },
+      Commute: { start: "8:00 AM",  end: "9:00 AM"  },
+      Other:   { start: "10:00 AM", end: "11:00 AM" },
+    };
+
+    const TYPE_COLORS: Record<BlockType, string> = {
+      Work:    ACCENT,
+      School:  "#42a5f5",
+      Kids:    "#66bb6a",
+      Commute: "#ffa040",
+      Other:   "#9e9e9e",
+    };
+
     const typeButtons: BlockType[] = ["Work", "School", "Kids", "Commute", "Other"];
+
+    const selectType = (t: BlockType) => {
+      setBlockType(t);
+      setBlockStart(TYPE_DEFAULTS[t].start);
+      setBlockEnd(TYPE_DEFAULTS[t].end);
+    };
 
     const addBlock = () => {
       const title = blockTitle.trim() || blockType;
@@ -4682,91 +8882,284 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
 
       setBlocks((prev) => [...prev, newBlock].sort((a, b) => a.startMin - b.startMin));
       setBlockTitle("");
+      setBlockStart(TYPE_DEFAULTS[blockType].start);
+      setBlockEnd(TYPE_DEFAULTS[blockType].end);
     };
 
     const removeBlock = (id: string) => setBlocks((prev) => prev.filter((b) => b.id !== id));
 
+    const activeColor = TYPE_COLORS[blockType];
+
+    const LABEL_PLACEHOLDER: Record<BlockType, string> = {
+      Work:    "e.g., Morning shift",
+      School:  "e.g., Classes",
+      Kids:    "e.g., School pickup",
+      Commute: "e.g., Train to work",
+      Other:   "e.g., Appointment",
+    };
+
     return (
-      <View style={{ flex: 1, gap: 12 }}>
-        <Text style={styles.h2}>Schedule</Text>
-        <Text style={styles.sub2}>Add blocks so the coach builds around your real life.</Text>
+      <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 40 }} showsVerticalScrollIndicator={false}>
 
-        <Card>
-          <Text style={styles.label}>Add a block</Text>
+        {/* ── Header ────────────────────────────────────────────────────────── */}
+        <View style={{ paddingBottom: 22 }}>
+          <Text style={{ color: "#ffffff", fontSize: 32, fontWeight: "800", letterSpacing: -0.8 }}>Schedule</Text>
+          <Text style={{ color: "#4a4a5a", fontSize: 12, fontWeight: "600", marginTop: 4, letterSpacing: 0.3 }}>
+            Your fixed commitments
+          </Text>
+          <Text style={{ color: "#383850", fontSize: 12, marginTop: 10, lineHeight: 18, fontWeight: "500" }}>
+            Aira builds around your real life. Add any fixed commitments — your plan slots around them automatically.
+          </Text>
+        </View>
 
-          <Text style={styles.smallLabel}>Type</Text>
-          <View style={styles.typeRow}>
+        {/* ── Add block form ─────────────────────────────────────────────────── */}
+        <View style={{
+          backgroundColor: "#0b0b16",
+          borderWidth: 1,
+          borderColor: activeColor + "30",
+          borderRadius: 18,
+          padding: 18,
+          marginBottom: 16,
+          gap: 16,
+        }}>
+          <Text style={{ color: "#505078", fontSize: 9, fontWeight: "900", letterSpacing: 1.5 }}>ADD A BLOCK</Text>
+
+          {/* Type pills — colored active state */}
+          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 7 }}>
             {typeButtons.map((t) => {
               const active = blockType === t;
+              const color  = TYPE_COLORS[t];
               return (
-                <Pressable key={t} onPress={() => setBlockType(t)} style={[styles.typeBtn, active && styles.typeBtnActive]}>
-                  <Text style={[styles.typeText, active && styles.typeTextActive]}>{t}</Text>
+                <Pressable
+                  key={t}
+                  onPress={() => selectType(t)}
+                  style={{
+                    backgroundColor: active ? color + "18" : "#0e0e1a",
+                    borderWidth:     1,
+                    borderColor:     active ? color + "60" : "#1e1e2e",
+                    borderRadius:    999,
+                    paddingVertical: 8,
+                    paddingHorizontal: 14,
+                  }}
+                >
+                  <Text style={{
+                    color:      active ? color : "#404060",
+                    fontWeight: "800",
+                    fontSize:   12,
+                    letterSpacing: 0.2,
+                  }}>
+                    {t}
+                  </Text>
                 </Pressable>
               );
             })}
           </View>
 
-          <Text style={styles.smallLabel}>Label (optional)</Text>
-          <TextInput value={blockTitle} onChangeText={setBlockTitle} placeholder="e.g., Work shift" placeholderTextColor="#777" style={styles.input} />
-
-          <View style={{ height: 10 }} />
-
-          <View style={{ flexDirection: "row", gap: 10 }}>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.smallLabel}>Start</Text>
-              <TextInput value={blockStart} onChangeText={setBlockStart} style={styles.input} />
-            </View>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.smallLabel}>End</Text>
-              <TextInput value={blockEnd} onChangeText={setBlockEnd} style={styles.input} />
-            </View>
-          </View>
-
-          <View style={{ height: 10 }} />
-          <PrimaryButton title="Add block" onPress={addBlock} />
-        </Card>
-
-        <Card style={{ flex: 1 }}>
-          <View style={styles.rowBetween}>
-            <Text style={styles.label}>Your blocks</Text>
-            <Pressable
-              onPress={() => {
-                if (!profile) return;
-                generatePlanFromProfileAndSchedule(profile, blocks);
-                setTab("Today");
+          {/* Label */}
+          <View style={{ gap: 6 }}>
+            <Text style={{ color: "#383858", fontSize: 10, fontWeight: "800", letterSpacing: 1.2 }}>LABEL (OPTIONAL)</Text>
+            <TextInput
+              value={blockTitle}
+              onChangeText={setBlockTitle}
+              placeholder={LABEL_PLACEHOLDER[blockType]}
+              placeholderTextColor="#252535"
+              style={{
+                backgroundColor: "#080810",
+                borderWidth:      1,
+                borderColor:      "#18182a",
+                borderRadius:     12,
+                padding:          12,
+                color:            "#e0e0f0",
+                fontSize:         14,
               }}
-              style={styles.linkBtn}
-            >
-              <Text style={styles.linkText}>Generate Plan</Text>
-            </Pressable>
+            />
           </View>
 
-          {blocks.length === 0 ? (
-            <Text style={styles.bodyMuted}>No blocks yet. Add Work/School/Kids time so the plan fits your day.</Text>
-          ) : (
-            <FlatList
-              data={blocks}
-              keyExtractor={(b) => b.id}
-              ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
-              renderItem={({ item }) => (
-                <View style={styles.blockRow}>
-                  <View style={{ flex: 1 }}>
-                    <Text style={styles.blockTitle}>{item.title}</Text>
-                    <Text style={styles.bodyMuted}>
-                      {item.type} • {item.startText}–{item.endText}
+          {/* Time range */}
+          <View style={{ flexDirection: "row", alignItems: "flex-end", gap: 8 }}>
+            <View style={{ flex: 1, gap: 6 }}>
+              <Text style={{ color: "#383858", fontSize: 10, fontWeight: "800", letterSpacing: 1.2 }}>START</Text>
+              <TextInput
+                value={blockStart}
+                onChangeText={setBlockStart}
+                placeholder="9:00 AM"
+                placeholderTextColor="#252535"
+                style={{
+                  backgroundColor: "#080810",
+                  borderWidth:      1,
+                  borderColor:      "#18182a",
+                  borderRadius:     12,
+                  padding:          12,
+                  color:            "#d8d8f0",
+                  fontSize:         14,
+                  fontWeight:       "700",
+                }}
+              />
+            </View>
+            <Text style={{ color: "#252535", fontSize: 16, fontWeight: "700", paddingBottom: 12 }}>→</Text>
+            <View style={{ flex: 1, gap: 6 }}>
+              <Text style={{ color: "#383858", fontSize: 10, fontWeight: "800", letterSpacing: 1.2 }}>END</Text>
+              <TextInput
+                value={blockEnd}
+                onChangeText={setBlockEnd}
+                placeholder="5:00 PM"
+                placeholderTextColor="#252535"
+                style={{
+                  backgroundColor: "#080810",
+                  borderWidth:      1,
+                  borderColor:      "#18182a",
+                  borderRadius:     12,
+                  padding:          12,
+                  color:            "#d8d8f0",
+                  fontSize:         14,
+                  fontWeight:       "700",
+                }}
+              />
+            </View>
+          </View>
+
+          {/* Save */}
+          <Pressable
+            onPress={addBlock}
+            style={{
+              backgroundColor: activeColor + "18",
+              borderWidth:      1,
+              borderColor:      activeColor + "50",
+              borderRadius:     12,
+              paddingVertical:  13,
+              alignItems:       "center",
+            }}
+          >
+            <Text style={{ color: activeColor, fontWeight: "800", fontSize: 14, letterSpacing: 0.2 }}>
+              Save block
+            </Text>
+          </Pressable>
+        </View>
+
+        {/* ── Block list ─────────────────────────────────────────────────────── */}
+        {blocks.length > 0 ? (
+          <View style={{ gap: 8, marginBottom: 16 }}>
+            <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+              <Text style={{ color: "#5a5a88", fontSize: 10, fontWeight: "800", letterSpacing: 1.2 }}>
+                YOUR BLOCKS
+              </Text>
+              <Text style={{ color: "#282840", fontSize: 10, fontWeight: "600" }}>
+                {blocks.length} window{blocks.length !== 1 ? "s" : ""} committed
+              </Text>
+            </View>
+
+            {blocks.map((block) => {
+              const color = TYPE_COLORS[block.type as BlockType] ?? "#555";
+              return (
+                <View
+                  key={block.id}
+                  style={{
+                    backgroundColor: "#0b0b14",
+                    borderWidth:      1,
+                    borderColor:      "#1a1a28",
+                    borderRadius:     14,
+                    flexDirection:    "row",
+                    overflow:         "hidden",
+                  }}
+                >
+                  {/* Type accent bar */}
+                  <View style={{ width: 4, backgroundColor: color + "70" }} />
+
+                  {/* Content */}
+                  <View style={{ flex: 1, paddingVertical: 13, paddingLeft: 13, paddingRight: 4, gap: 5 }}>
+                    <Text style={{ color: "#d8d8f0", fontWeight: "800", fontSize: 14, letterSpacing: -0.2 }}>
+                      {block.title}
                     </Text>
+                    <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                      <View style={{
+                        backgroundColor: color + "15",
+                        borderRadius:     4,
+                        paddingHorizontal: 6,
+                        paddingVertical:   2,
+                      }}>
+                        <Text style={{ color: color + "b0", fontSize: 9, fontWeight: "900", letterSpacing: 0.8 }}>
+                          {block.type.toUpperCase()}
+                        </Text>
+                      </View>
+                      <Text style={{ color: "#3a3a58", fontSize: 11, fontWeight: "700" }}>
+                        {block.startText} – {block.endText}
+                      </Text>
+                    </View>
                   </View>
 
-                  <Pressable onPress={() => removeBlock(item.id)} style={styles.removeBtn}>
-                    <Text style={styles.removeText}>Remove</Text>
+                  {/* Delete */}
+                  <Pressable
+                    onPress={() => removeBlock(block.id)}
+                    hitSlop={{ top: 14, bottom: 14, left: 8, right: 4 }}
+                    style={{ justifyContent: "center", paddingHorizontal: 16 }}
+                  >
+                    <Text style={{ color: "#2a2a3e", fontSize: 15, fontWeight: "700" }}>✕</Text>
                   </Pressable>
                 </View>
-              )}
-            />
-          )}
+              );
+            })}
+          </View>
+        ) : (
+          <View style={{
+            backgroundColor: "#08080f",
+            borderWidth:      1,
+            borderColor:      "#111120",
+            borderRadius:     14,
+            paddingVertical:  24,
+            paddingHorizontal: 20,
+            alignItems:       "center",
+            gap:              6,
+            marginBottom:     16,
+          }}>
+            <Text style={{ color: "#252538", fontSize: 13, fontWeight: "700", textAlign: "center" }}>
+              No blocks yet
+            </Text>
+            <Text style={{ color: "#1e1e2e", fontSize: 12, textAlign: "center", lineHeight: 18 }}>
+              Add your first commitment and Aira will build your day around it.
+            </Text>
+          </View>
+        )}
 
-        </Card>
-      </View>
+        {/* ── Plan connection CTA ─────────────────────────────────────────────── */}
+        <Pressable
+          onPress={() => {
+            if (gamePlan) generateAIPlan();
+            setOverlay(null);
+          }}
+          style={{
+            backgroundColor: gamePlan ? ACCENT + "12" : "#080810",
+            borderWidth:      1,
+            borderColor:      gamePlan ? ACCENT + "38" : "#141422",
+            borderRadius:     16,
+            padding:          18,
+            gap:              6,
+            ...(gamePlan ? {
+              shadowColor:   ACCENT,
+              shadowOpacity: 0.1,
+              shadowRadius:  14,
+              shadowOffset:  { width: 0, height: 0 },
+            } : {}),
+          }}
+        >
+          <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+            <Text style={{
+              color:        gamePlan ? ACCENT + "b0" : "#282840",
+              fontSize:     9,
+              fontWeight:   "900",
+              letterSpacing: 1.4,
+            }}>
+              {gamePlan ? "READY TO BUILD" : "CHECK IN FIRST"}
+            </Text>
+            <Text style={{ color: gamePlan ? ACCENT + "60" : "#1e1e30", fontSize: 16, fontWeight: "700" }}>›</Text>
+          </View>
+          <Text style={{ color: gamePlan ? "#b0b0d0" : "#30304a", fontSize: 13, fontWeight: "700", lineHeight: 20 }}>
+            {gamePlan
+              ? `Generate your plan — Aira will build around your ${blocks.length > 0 ? `${blocks.length} committed block${blocks.length !== 1 ? "s" : ""}` : "day"}.`
+              : "Complete your check-in on Today, then your schedule feeds directly into the plan."}
+          </Text>
+        </Pressable>
+
+      </ScrollView>
     );
   };
 
@@ -4816,7 +9209,7 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
       <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 20 }}>
         <View style={{ gap: 12 }}>
           <Text style={styles.h2}>Progress</Text>
-          <Text style={styles.sub2}>{profile?.goal ?? "Your goal"}</Text>
+          <Text style={styles.sub2}>{profile?.goals?.goalLabel ?? "Your goal"}</Text>
 
           {/* Streaks */}
           <Card>
@@ -4911,10 +9304,73 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
             );
           })()}
 
+          {/* Weekly Momentum card */}
+          {weeklyMomentum && (() => {
+            const momentumMeta: Record<WeeklyMomentumStatus, { color: string; icon: string }> = {
+              STRONG:   { color: "#4CAF50", icon: "▲" },
+              BUILDING: { color: ACCENT,    icon: "◆" },
+              SLIPPING: { color: "#FF5252", icon: "▼" },
+            };
+            const meta = momentumMeta[weeklyMomentum.status];
+            return (
+              <View style={{
+                backgroundColor: "#070710",
+                borderWidth: 1,
+                borderColor: meta.color + "35",
+                borderRadius: 16,
+                padding: 18,
+                gap: 10,
+                shadowColor: meta.color,
+                shadowOpacity: 0.06,
+                shadowRadius: 14,
+                shadowOffset: { width: 0, height: 0 },
+              }}>
+                {/* Header row */}
+                <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+                  <Text style={{ color: "#505070", fontSize: 9, fontWeight: "900", letterSpacing: 1.6 }}>WEEKLY MOMENTUM</Text>
+                  <View style={{
+                    flexDirection: "row", alignItems: "center", gap: 5,
+                    backgroundColor: meta.color + "18",
+                    borderRadius: 6,
+                    paddingHorizontal: 8,
+                    paddingVertical: 3,
+                  }}>
+                    <Text style={{ color: meta.color, fontSize: 9, fontWeight: "900" }}>{meta.icon}</Text>
+                    <Text style={{ color: meta.color + "cc", fontSize: 9, fontWeight: "900", letterSpacing: 1 }}>
+                      {weeklyMomentum.status}
+                    </Text>
+                  </View>
+                </View>
+
+                {/* Summary */}
+                <Text style={{
+                  color:       weeklyMomentum.status === "STRONG" ? "#c8e8c8" : weeklyMomentum.status === "SLIPPING" ? "#e8c8c8" : "#c8c8e8",
+                  fontSize:    14,
+                  fontWeight:  "700",
+                  lineHeight:  21,
+                  letterSpacing: -0.1,
+                }}>
+                  {weeklyMomentum.summary}
+                </Text>
+
+                {/* Focus directive */}
+                <View style={{
+                  flexDirection: "row", alignItems: "flex-start", gap: 8,
+                  borderTopWidth: 1, borderTopColor: "#1a1a2c", paddingTop: 10,
+                }}>
+                  <Text style={{ color: meta.color + "60", fontSize: 11, fontWeight: "700", marginTop: 1 }}>→</Text>
+                  <Text style={{ flex: 1, color: "#7070a0", fontSize: 12, fontWeight: "600", lineHeight: 18 }}>
+                    {weeklyMomentum.focus}
+                  </Text>
+                </View>
+              </View>
+            );
+          })()}
+
           {/* Today's performance */}
           <Card>
             <View style={styles.rowBetween}>
-              <Text style={styles.label}>Today's performance</Text>
+              <Text style={styles.label}>Today&apos;s performance</Text>
               <Chip label={`${score}/100`} />
             </View>
             <View
@@ -4999,7 +9455,7 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
             return (
               <Card>
                 <View style={styles.rowBetween}>
-                  <Text style={styles.label}>Today's check-in</Text>
+                  <Text style={styles.label}>Today&apos;s check-in</Text>
                   <Pressable onPress={() => setShowMotivation(true)}>
                     <Text style={[styles.miniNote, { color: ACCENT }]}>Update →</Text>
                   </Pressable>
@@ -5113,7 +9569,7 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
           {/* Today's insight */}
           {total > 0 && (
             <Card>
-              <Text style={styles.label}>Today's insight</Text>
+              <Text style={styles.label}>Today&apos;s insight</Text>
               <Text style={[styles.bodyMuted, { marginTop: 4, lineHeight: 20 }]}>
                 {insight}
               </Text>
@@ -5144,7 +9600,7 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
           {(() => {
             const myEntry: LeaderboardEntry = {
               id: "me",
-              name: profile?.name ?? "You",
+              name: profile?.profile?.firstName ?? "You",
               currentStreak: liveStreak,
               bestStreak: streak.bestStreak,
               isMe: true,
@@ -5232,23 +9688,51 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
 
   // ---------- Settings ----------
   const Settings = () => {
-    const [editName, setEditName] = useState(profile?.name ?? "");
-    const [editGoal, setEditGoal] = useState(profile?.goal ?? "");
-    const [editWake, setEditWake] = useState(profile?.wake ?? "7:00 AM");
-    const [editSleep, setEditSleep] = useState(profile?.sleep ?? "11:00 PM");
+    const [editName, setEditName] = useState(profile?.profile?.firstName ?? "");
+    const [editGoal, setEditGoal] = useState(profile?.goals?.goalLabel ?? "");
+    const [editWake, setEditWake] = useState(profile?.sleep?.wakeTime ?? "7:00 AM");
+    const [editSleep, setEditSleep] = useState(profile?.sleep?.sleepTime ?? "11:00 PM");
 
     const saveProfile = () => {
-      const updated: Profile = {
-        ...profile!,
-        name: editName.trim(),
-        goal: editGoal.trim(),
-        wake: editWake.trim(),
-        sleep: editSleep.trim(),
-      };
-      if (!updated.name) {
+      const base = profile!;
+      const updatedProfile  = { ...base.profile, firstName: editName.trim() };
+      const updatedGoals    = { ...base.goals,   goalLabel:  editGoal.trim() };
+      const updatedSleep    = { ...base.sleep,   wakeTime:   editWake.trim(), sleepTime: editSleep.trim() };
+
+      if (!updatedProfile.firstName) {
         Alert.alert("Name required", "Please enter your name.");
         return;
       }
+
+      const sleepDur = sleepDurationMins(updatedSleep.sleepTime, updatedSleep.wakeTime);
+      if (sleepDur == null) {
+        Alert.alert("Time format issue", "Enter wake/sleep like '7:00 AM' or '11:30 PM'.");
+        return;
+      }
+      if (sleepDur < 60) {
+        Alert.alert("Sleep time issue", "Sleep window must be at least 1 hour.");
+        return;
+      }
+
+      const { dataConfidenceScore, optionalFieldsSkipped } = computeProfileMeta({
+        profile:  updatedProfile,
+        goals:    updatedGoals,
+        schedule: base.schedule,
+      });
+
+      const updated: Profile = {
+        ...base,
+        profile:  updatedProfile,
+        goals:    updatedGoals,
+        sleep:    updatedSleep,
+        meta: {
+          ...base.meta,
+          lastUpdatedAt:        new Date().toISOString(),
+          dataConfidenceScore,
+          optionalFieldsSkipped,
+        },
+      };
+
       setProfile(updated);
       Alert.alert("Saved", "Your profile has been updated.");
     };
@@ -5329,7 +9813,7 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
             </View>
             {!notifReady ? (
               <Text style={styles.miniNote}>
-                To enable, open your phone's Settings → Notifications → Expo Go and turn them on.
+                To enable, open your phone&apos;s Settings → Notifications → Expo Go and turn them on.
               </Text>
             ) : (
               <Text style={styles.miniNote}>
@@ -5385,9 +9869,12 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
     <SafeAreaView style={styles.screen}>
       <StatusBar barStyle="light-content" />
       <View style={{ flex: 1 }}>
-        {tab === "Today" && Today()}
-        {tab === "Schedule" && <Schedule />}
-        {tab === "Chat" && (
+        {/* Overlays — Settings and Schedule accessed from Home, not from tab bar */}
+        {overlay === "settings" && <Settings />}
+        {overlay === "schedule" && <Schedule />}
+        {/* Tab content — hidden when overlay is active */}
+        {overlay === null && tab === "Home" && Today()}
+        {overlay === null && tab === "Coach" && (
           <ChatScreen
             messages={messages}
             setMessages={setMessages}
@@ -5400,23 +9887,88 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
             rebalancedTasks={rebalancedTasks}
             recoveryStatus={recoveryStatus}
             liveStreak={liveStreak}
+            bestStreak={streak.bestStreak}
             score={score}
             gamePlan={gamePlan}
+            userContext={userContext}
+            predictiveInsights={predictiveInsights}
+            nextBestAction={nextBestAction}
+            winCondition={winCondition}
+            dayEvaluation={dayEvaluation}
+            tomorrowPrep={tomorrowPrep}
+            weeklyMomentum={weeklyMomentum}
+            saveTheDay={saveTheDay}
+            readinessState={readinessState}
+            coachMode={coachMode}
+            memoryContext={memoryContext}
+            onPlanAction={handlePlanAction}
           />
         )}
-        {tab === "Progress" && <Progress />}
-        {tab === "Settings" && <Settings />}
+        {overlay === null && tab === "Progress" && <Progress />}
       </View>
       <View style={styles.tabBar}>
-        {(["Today", "Schedule", "Chat", "Progress", "Settings"] as TabKey[]).map((t) => (
+        {/* Home */}
+        <Pressable
+          onPress={() => { setTab("Home"); setOverlay(null); }}
+          style={({ pressed }) => [
+            styles.tabBtn,
+            tab === "Home" && overlay === null && styles.tabBtnActive,
+            { opacity: pressed ? 0.72 : 1, transform: [{ scale: pressed ? 0.96 : 1 }] },
+          ]}
+        >
+          <Text style={[styles.tabText, tab === "Home" && overlay === null && styles.tabTextActive]}>Home</Text>
+        </Pressable>
+
+        {/* Coach — elevated center tab */}
+        <View style={{ flex: 1, alignItems: "center" }}>
           <Pressable
-            key={t}
-            onPress={() => setTab(t)}
-            style={[styles.tabBtn, tab === t && styles.tabBtnActive]}
+            onPress={() => { setTab("Coach"); setOverlay(null); }}
+            style={({ pressed }) => ({
+              marginTop:  -22,
+              alignItems: "center",
+              opacity:    pressed ? 0.85 : 1,
+              transform:  [{ scale: pressed ? 0.95 : 1 }],
+            })}
           >
-            <Text style={[styles.tabText, tab === t && styles.tabTextActive]}>{t}</Text>
+            {/* Outer glow bloom — wide soft halo */}
+            <View style={{
+              position:      "absolute",
+              top:           -6, left: -10, right: -10, bottom: -6,
+              borderRadius:  26,
+              shadowColor:   "#7B63FF",
+              shadowOpacity: tab === "Coach" && overlay === null ? 0.72 : 0.36,
+              shadowRadius:  tab === "Coach" && overlay === null ? 28 : 16,
+              shadowOffset:  { width: 0, height: 4 },
+              elevation:     12,
+            }} />
+            <LinearGradient
+              colors={["#4f8ef7", "#7B63FF", "#c063e8"]}
+              start={{ x: 0, y: 0 }}
+              end={{ x: 1, y: 1 }}
+              style={{
+                borderRadius:    18,
+                paddingVertical: 11,
+                paddingHorizontal: 24,
+                alignItems:      "center",
+                opacity:         tab === "Coach" && overlay === null ? 1 : 0.55,
+              }}
+            >
+              <Text style={{ color: "#ffffff", fontWeight: "900", fontSize: 12, letterSpacing: 0.3 }}>Coach</Text>
+            </LinearGradient>
           </Pressable>
-        ))}
+        </View>
+
+        {/* Progress */}
+        <Pressable
+          onPress={() => { setTab("Progress"); setOverlay(null); }}
+          style={({ pressed }) => [
+            styles.tabBtn,
+            tab === "Progress" && overlay === null && styles.tabBtnActive,
+            { opacity: pressed ? 0.72 : 1, transform: [{ scale: pressed ? 0.96 : 1 }] },
+          ]}
+        >
+          <Text style={[styles.tabText, tab === "Progress" && overlay === null && styles.tabTextActive]}>Progress</Text>
+        </Pressable>
       </View>
 
       {/* ---------- Workout detail modal ---------- */}
@@ -5426,6 +9978,7 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
         visible={workoutTask !== null}
         onClose={() => setWorkoutTask(null)}
         onCompleteTask={(id) => toggleTaskById(id)}
+        workoutPlan={generatedPlan?.workout}
       />
 
       {/* ---------- Nutrition detail modal ---------- */}
@@ -5435,6 +9988,7 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
         visible={nutritionTask !== null}
         onClose={() => setNutritionTask(null)}
         onCompleteTask={(id) => { toggleTaskById(id); }}
+        nutritionPlan={generatedPlan?.nutrition}
       />
 
       {/* ---------- Recovery detail modal ---------- */}
@@ -5444,6 +9998,7 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
         visible={recoveryTask !== null}
         onClose={() => setRecoveryTask(null)}
         onCompleteTask={(id) => { toggleTaskById(id); }}
+        recoveryPlan={generatedPlan?.recovery}
       />
 
       {/* ---------- Habit detail modal ---------- */}
@@ -5479,7 +10034,7 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
             <View style={[styles.card, { gap: 18 }]}>
               <View style={{ gap: 4 }}>
                 <Text style={styles.label}>Daily check-in</Text>
-                <Text style={styles.bodyMuted}>Good morning, {profile?.name ?? "Coach"}. 5 questions.</Text>
+                <Text style={styles.bodyMuted}>Good morning, {profile?.profile?.firstName ?? "Coach"}. 5 questions.</Text>
               </View>
 
               {/* Energy */}
@@ -5593,9 +10148,12 @@ const [dayMode, setDayMode] = useState<"today" | "tomorrow">("today");
                       timeAvailable:   ciTime,
                       focusArea:       ciFocus,
                     };
+                    const newGamePlan = generateGamePlan(newRecovery);
                     setRecovery(newRecovery);
-                    setGamePlan(generateGamePlan(newRecovery));
+                    setGamePlan(newGamePlan);
                     setShowMotivation(false);
+                    generateAIPlan(newRecovery, newGamePlan);
+                    setTab("Home");
                   }}
                 />
                 <Pressable onPress={() => setShowMotivation(false)} style={{ alignItems: "center", paddingVertical: 8 }}>
